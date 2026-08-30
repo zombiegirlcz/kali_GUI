@@ -36,4 +36,5 @@ captures/
 
 # pi agent state dir
 .pi/
-
+#core apk
+kali_core_emulator

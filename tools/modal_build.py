@@ -1,21 +1,29 @@
 """Modal build pipeline for kali_core_emulator.
 
+Zdroj pravdy je GitHub (zombiegirlcz/kali_core_emulator), ne lokální disk.
+Modal si zdrojový strom natahuje sám přes git clone/fetch přímo z GitHubu —
+žádný upload z telefonu, žádný rsync přes mobilní síť.
+
 Volume layout after setup:
   /vol/keys/release.jks        – signing keystore (persistent)
-  /vol/src/                    – project source tree (upload once, update on change)
+  /vol/src/                    – project source tree (git clone z GitHubu)
   /vol/gradle-cache/           – gradle dependency cache (persistent)
   /vol/builds/app-debug.apk    – latest built APK
 
 Setup:
   1) modal secret create build-secrets RELEASE_JKS_BASE64=$(base64 -w0 app/release.jks)
-  2) modal run modal_build.py init     # store keystore
-  3) modal run modal_build.py upload   # upload source (basic, bez mazání)
-  4) modal run modal_build.py all      # compile native + build APK
+  2) modal secret create github-token GITHUB_TOKEN=<personal access token>
+  3) modal run modal_build.py init     # store keystore
+  4) modal run modal_build.py sync     # git clone/pull zdroje z GitHubu
+  5) modal run modal_build.py all      # compile native + build APK
 
-Upload (VŽDY samostatně — buildy ho nikdy nevolají):
-  modal run modal_build.py upload        # rsync bez --delete (jen přidá/aktualizuje)
-  modal run modal_build.py upload_force  # rsync --delete (plný mirror lokálního repa)
-  modal run modal_build.py upload_clean  # smaže src + gradle-cache (keys/builds zůstanou)
+Sync (VŽDY samostatně — buildy ho nikdy nevolají):
+  modal run modal_build.py sync   # git clone (poprvé) nebo fetch+reset --hard (dál)
+  modal run modal_build.py clean  # smaže src + gradle-cache na Volume (keys/builds zůstanou)
+
+Pravidlo zůstává stejné jako dřív: lokální git push na GitHub je jediný krok
+z telefonu. Modal si zbytek (stažení, sestavení) dělá sám přes svou vlastní,
+mnohem stabilnější síť.
 
 Individual steps:
   modal run modal_build.py native      # NDK cross-compile C binaries + usr tools (nano/rsync/sed/rg)
@@ -25,36 +33,35 @@ Individual steps:
 
 # Force rebuild marker: 2026-07-07T02:00:00Z
 
+import json
 import modal
 import os
 import shutil
 import subprocess
 import sys
 
-app = modal.App("kali-gui-build")
+APP_NAME = "kali-gui-build"
+VOLUME_NAME = "kali-gui-build-data"
+APK_OUTPUT = "kali-gui-debug.apk"
+
+app = modal.App(APP_NAME)
 
 ANDROID_SDK_ROOT = "/opt/android-sdk"
 
-build_vol = modal.Volume.from_name("kali-gui-build-data", create_if_missing=True)
+build_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-_IGNORE_PARTS = frozenset({".git", ".gradle", "__pycache__", "node_modules", "logcat.log", "build.log", "top.log"})
-
-# (2026-08-14, boot refactor) Žádné excludes při uploadu. Lokální repo je
-# zdroj pravdy: build artefakty (su_daemon, su_wrapper, usb_bridge,
-# assets/usr/*) se po native buildu stahují zpět přes pull_full_assets,
-# takže upload může synchronizovat celý strom. Volume se vždy přizpůsobuje
-# lokálnímu repu, nikdy naopak.
-
-
-def _ignore_path(p):
-    """Return True for paths that should be EXCLUDED (ignore=True = skip)."""
-    parts = p.parts
-    for i, part in enumerate(parts):
-        if part in _IGNORE_PARTS:
-            return True
-        if part == "build" and i > 0 and parts[i - 1] == "app":
-            return True
-    return False
+# ── GitHub jako zdroj pravdy ─────────────────────────────────────────────────
+# Repo se klonuje/pulluje přímo na Modal straně, nikdy se z telefonu neuploaduje
+# nic ručně. .gitignore v repu (build/, .gradle/, __pycache__, *.log, ...) řeší
+# excludes stejně, jako to dřív dělal _IGNORE_PARTS — build artefakty (su_daemon,
+# su_wrapper, usb_bridge, assets/usr/*) jsou po native buildu commitnuté zpět
+# do repa (pull_full_assets → git add/commit/push), takže sync vždy odpovídá
+# 1:1 tomu, co je na GitHubu.
+# HARDCODEOVANO na projekt (nasazeno pres sed). ZAMERNE bez os.environ.get -
+# Modal forwarduje env z lokalniho shellu, takze GITHUB_REPO v exportu by
+# prepisoval default a GUI/assistant by klonovaly core. Proto literál.
+GITHUB_REPO = "zombiegirlcz/kali_GUI"
+GITHUB_BRANCH = "master"
 
 
 # ── Image with Android SDK + JDK 21 + NDK ────────────────────────────────────
@@ -88,13 +95,9 @@ base_image = (
     })
 )
 
-# Static image: base + source baked in (for upload_basic/upload_force/upload_clean)
-source_image = base_image.add_local_dir(
-    "/root/kali_core_emulator",
-    remote_path="/src-baked",
-    ignore=_ignore_path,
-)
-
+# (Dřívější blok tady pekl lokální adresář z telefonu do image přes
+# add_local_dir — to byl přesně ten nespolehlivý "upload" krok. Nahrazeno
+# funkcí sync() níže, která běží na Modal straně a stahuje z GitHubu sama.)
 
 # ── Usr tools: nano/rsync/sed (glibc bridge) + ripgrep (Bionic) ──────────────
 # Runtime prefix na zařízení — APK je nese v assets/usr/, aplikace je pak
@@ -135,60 +138,64 @@ usrtools_image = (
 )
 
 
-# ── Upload source to Volume ──────────────────────────────────────────────────
-# NOTE: plain helper (NOT @app.function) — it is invoked directly from
-# upload_basic/upload_force inside their remote container. A Function object
-# is not directly callable (would raise 'Function' object is not callable).
-def _upload_common(delete: bool):
-    dest = "/vol/src"
-    if os.path.isdir(dest):
-        cmd = ["rsync", "-a"]
-        if delete:
-            cmd.append("--delete")
-        cmd += ["/src-baked/", dest]
-        print(f"[upload] {'--delete mirror' if delete else 'incremental'}: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-    else:
-        print(f"[upload] Copying source tree to {dest} ...")
-        shutil.copytree("/src-baked", dest, symlinks=True)
-    build_vol.commit()
-    print("[upload] Done. Source tree committed to Volume.")
-
-
+# ── Sync source from GitHub to Volume ────────────────────────────────────────
 @app.function(
-    image=source_image,
+    image=base_image,
     volumes={"/vol": build_vol},
+    secrets=[modal.Secret.from_name("github-token")],
     timeout=600,
-    memory=2048,
-)
-def upload_basic():
-    """rsync BEZ --delete: přidá/aktualizuje soubory z lokálního repa, nikdy
-    nemaže nic, co na Volume je navíc. Bezpečný inkrementální upload."""
-    _upload_common(delete=False)
-
-
-@app.function(
-    image=source_image,
-    volumes={"/vol": build_vol},
-    timeout=600,
-    memory=2048,
-)
-def upload_force():
-    """rsync --delete: plný mirror lokálního repa na Volume — smaže z Volume
-    vše, co lokálně není. Používat až když lokální assets obsahují všechny
-    build artefakty (po pull_full_assets)."""
-    _upload_common(delete=True)
-
-
-@app.function(
-    image=source_image,
-    volumes={"/vol": build_vol},
-    timeout=300,
     memory=1024,
 )
-def upload_clean():
-    """Smaže /vol/src a /vol/gradle-cache (keys + builds zůstanou).
-    Následuj upload_basic pro čerstvý baseline."""
+def sync():
+    """Git clone (poprvé) nebo fetch + reset --hard (dál) přímo z GitHubu.
+
+    Nahrazuje upload_basic/upload_force/upload_clean. Žádný rsync z telefonu —
+    Modal si repo stahuje sám přes vlastní síť. Výsledný strom na Volume vždy
+    1:1 odpovídá GITHUB_BRANCH na GitHubu (deterministické, žádná otázka
+    "mazat, nebo ne" jako u rsyncu).
+    """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    auth = f"{token}@" if token else ""
+    repo_url = f"https://{auth}github.com/{GITHUB_REPO}.git"
+    dest = "/vol/src"
+
+    if os.path.isdir(os.path.join(dest, ".git")):
+        print(f"[sync] Repo už existuje na Volume — fetch + reset --hard origin/{GITHUB_BRANCH}")
+        subprocess.run(["git", "remote", "set-url", "origin", repo_url], cwd=dest, check=True)
+        subprocess.run(["git", "fetch", "origin", GITHUB_BRANCH], cwd=dest, check=True)
+        subprocess.run(["git", "reset", "--hard", f"origin/{GITHUB_BRANCH}"], cwd=dest, check=True)
+        # ZÁMĚRNĚ BEZ `git clean`: ponechává postavené build artefakty
+        # (proot-static-*, loader-static-*, *.so, binárky v assets/), které NEjsou
+        # v gitu (untracked). Díky tomu `smart_build` najde proot/lib/bin na
+        # Volume a podle `git diff` rozhodne o skipu. `reset --hard` aktualizuje
+        # tracked soubory 1:1 na GitHub; untracked artefakty přežijí sync.
+    else:
+        print(f"[sync] Klonuji {GITHUB_REPO}@{GITHUB_BRANCH} -> {dest}")
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        subprocess.run(
+            ["git", "clone", "--branch", GITHUB_BRANCH, repo_url, dest],
+            check=True,
+        )
+
+    # Zamaskovat token v remote URL, kdyby si někdo dal `git remote -v`.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", f"https://github.com/{GITHUB_REPO}.git"],
+        cwd=dest, check=True,
+    )
+    build_vol.commit()
+    print("[sync] Hotovo. Tracked strom = 1:1 GitHub; build artefakty (proot/lib/bin) zachovány.")
+
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=600,
+    memory=1024,
+)
+def clean():
+    """Smaže /vol/src a /vol/gradle-cache (keys/builds zůstanou).
+    Následuj sync() pro čerstvý baseline z GitHubu."""
     for p in ("/vol/src", "/vol/gradle-cache"):
         if os.path.isdir(p):
             shutil.rmtree(p, ignore_errors=True)
@@ -197,6 +204,8 @@ def upload_clean():
             print(f"[clean] {p} absent")
     build_vol.commit()
     print("[clean] Done.")
+
+
 
 
 # ── Initialize signing key on Volume ─────────────────────────────────────────
@@ -249,88 +258,137 @@ def init_keys():
     cpu=4,
 )
 def build_native():
-    """Cross-compile native binaries into the APK assets.
-
-    NDK (Bionic):
-      jniLibs/arm64-v8a/libusbfd_exporter.so
-      assets/usb_bridge, assets/su_daemon, assets/su_wrapper
-
-    Usr tools (assets/usr/ — běží přímo na hostu, bez PRootu):
-      assets/usr/bin/{sed,rsync,nano,rg}  Bionic (aarch64-linux-android, linker64)
-      assets/usr/lib/                   (prázdné — ncursesw staticky v nano)
-      /vol/builds/usrtools.tar.gz         bin/+lib/ → extrahovat do $PREFIX
-    """
+    """Full native build (lib + bin + usr tools)."""
     src_dir = "/vol/src"
     cpp_dir = os.path.join(src_dir, "app/src/main/cpp")
+    if not os.path.isdir(cpp_dir):
+        print(f"[native] {cpp_dir} neexistuje — projekt nemá nativní kód, "
+              "NDK binárky budou přeskočeny.")
+    else:
+        _build_native_lib(src_dir)
+        _build_native_bin(src_dir)
+    _build_usrtools(
+        os.path.join(src_dir, "app/src/main/assets", "usr"),
+        "/vol/builds",
+    )
+    build_vol.commit()
+    print("[native] Binaries committed to Volume.")
 
-    # NDK toolchain
+
+# ── Granulární native buildy (pro smart_build) ──────────────────────────────
+def _build_native_lib(src_dir):
+    """libusbfd_exporter.so (JNI shared library)."""
+    cpp_dir = os.path.join(src_dir, "app/src/main/cpp")
     tc_bin = f"{NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
     cc = f"{tc_bin}/aarch64-linux-android24-clang"
-
-    # Output paths
     jnilibs_dir = os.path.join(src_dir, "app/src/main/jniLibs/arm64-v8a")
     assets_dir = os.path.join(src_dir, "app/src/main/assets")
     os.makedirs(jnilibs_dir, exist_ok=True)
     os.makedirs(assets_dir, exist_ok=True)
-
     so_path = os.path.join(jnilibs_dir, "libusbfd_exporter.so")
-    bin_path = os.path.join(assets_dir, "usb_bridge")
-
-    # ── 1. Build libusbfd_exporter.so (JNI shared library) ──────────────────
-    print("─" * 60)
-    print("[native] Building libusbfd_exporter.so ...")
     jni_src = os.path.join(cpp_dir, "usbfd_jni.c")
+    if not os.path.isdir(cpp_dir):
+        print(f"[native-lib] {cpp_dir} neexistuje — libusbfd_exporter.so PŘESKOČEN")
+        return
+    if not os.path.exists(jni_src):
+        print(f"[native-lib] {jni_src} chybí — libusbfd_exporter.so PŘESKOČEN")
+        return
     cmd = [cc, "-shared", "-fPIC", "-o", so_path, jni_src, "-llog", "-landroid"]
+    print("─" * 60)
+    print("[native-lib] Building libusbfd_exporter.so ...")
     print(f"  {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
     print(f"  OK  ({os.path.getsize(so_path):,} B)")
 
-    # ── 2. Build usb_bridge (static binary for PRoot) ────────────────────────
-    print("─" * 60)
-    print("[native] Building usb_bridge (static)...")
-    bridge_src = os.path.join(cpp_dir, "usb_bridge.c")
-    cmd = [cc, "-static", "-o", bin_path, bridge_src]
-    print(f"  {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    print(f"  OK  ({os.path.getsize(bin_path):,} B)")
 
-    # ── 3. Build su_daemon (host root daemon) ──────────────────────────────────
+def _build_native_bin(src_dir):
+    """usb_bridge (static) + su_daemon + su_wrapper."""
+    cpp_dir = os.path.join(src_dir, "app/src/main/cpp")
+    tc_bin = f"{NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    cc = f"{tc_bin}/aarch64-linux-android24-clang"
+    assets_dir = os.path.join(src_dir, "app/src/main/assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    if not os.path.isdir(cpp_dir):
+        print(f"[native-bin] {cpp_dir} neexistuje — binárky PŘESKOČENY")
+        return
+    # usb_bridge
     print("─" * 60)
-    print("[native] Building su_daemon...")
+    print("[native-bin] Building usb_bridge (static)...")
+    bridge_src = os.path.join(cpp_dir, "usb_bridge.c")
+    bin_path = os.path.join(assets_dir, "usb_bridge")
+    if not os.path.exists(bridge_src):
+        print(f"[native-bin] {bridge_src} chybí — usb_bridge PŘESKOČEN")
+    else:
+        cmd = [cc, "-static", "-o", bin_path, bridge_src]
+        print(f"  {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        print(f"  OK  ({os.path.getsize(bin_path):,} B)")
+    # su_daemon
+    print("─" * 60)
+    print("[native-bin] Building su_daemon...")
     daemon_src = os.path.join(cpp_dir, "su_daemon.c")
     daemon_bin_path = os.path.join(assets_dir, "su_daemon")
-    cmd = [cc, "-o", daemon_bin_path, daemon_src]
-    print(f"  {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    print(f"  OK  ({os.path.getsize(daemon_bin_path):,} B)")
-
-    # ── 4. Build su_wrapper (static binary for PRoot) ─────────────────────────
+    if not os.path.exists(daemon_src):
+        print(f"[native-bin] {daemon_src} chybí — su_daemon PŘESKOČEN")
+    else:
+        cmd = [cc, "-o", daemon_bin_path, daemon_src]
+        print(f"  {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        print(f"  OK  ({os.path.getsize(daemon_bin_path):,} B)")
+    # su_wrapper
     print("─" * 60)
-    print("[native] Building su_wrapper (static)...")
+    print("[native-bin] Building su_wrapper (static)...")
     wrapper_src = os.path.join(cpp_dir, "su_wrapper.c")
     wrapper_bin_path = os.path.join(assets_dir, "su_wrapper")
-    cmd = [cc, "-static", "-o", wrapper_bin_path, wrapper_src]
-    print(f"  {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    print(f"  OK  ({os.path.getsize(wrapper_bin_path):,} B)")
+    if not os.path.exists(wrapper_src):
+        print(f"[native-bin] {wrapper_src} chybí — su_wrapper PŘESKOČEN")
+    else:
+        cmd = [cc, "-static", "-o", wrapper_bin_path, wrapper_src]
+        print(f"  {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+        print(f"  OK  ({os.path.getsize(wrapper_bin_path):,} B)")
 
-    # ── 5. Usr tools: sed/rsync/nano/rg (vše Bionic) ─────────────────────────
-    # Výstup: assets/usr/{bin,lib} (jde do APK) + /vol/builds/usrtools.tar.gz.
-    print("─" * 60)
-    print("[native] Building usr tools (sed/rsync/nano/rg) ...")
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=8192,
+    cpu=4,
+)
+def build_native_lib():
+    _build_native_lib("/vol/src")
+    build_vol.commit()
+    print("[native-lib] committed")
+
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=8192,
+    cpu=4,
+)
+def build_native_bin():
+    _build_native_bin("/vol/src")
+    build_vol.commit()
+    print("[native-bin] committed")
+
+
+@app.function(
+    image=usrtools_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=8192,
+    cpu=4,
+)
+def build_usrtools():
     _build_usrtools(
-        os.path.join(assets_dir, "usr"),
+        os.path.join("/vol/src", "app/src/main/assets", "usr"),
         "/vol/builds",
     )
-
-
-    # USB gadget tools (libusbgx/usbutils/usbrelayd) are no longer built
-    # into app assets. They are provided by the Magisk module
-    # (magisk-modules/custom_usb_g2_setup/) which installs them to /system.
-
-    # Commit to Volume
     build_vol.commit()
-    print(f"[native] Binaries committed to Volume.")
+    print("[usrtools] committed")
 
 # ── Usr tools build: nano/rsync/sed (glibc bridge) + ripgrep (Bionic) ───────
 def _build_usrtools(assets_usr, builds_dir):
@@ -919,8 +977,8 @@ def build():
     if not os.path.isdir(src_dir):
         print(
             "[build] Source directory not found on Volume.  "
-            "Upload first (upload je vždy samostatný krok):\n"
-            "  modal run modal_build.py::upload_basic",
+            "Sync first (sync je vždy samostatný krok):\n"
+            "  modal run modal_build.py::sync",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -972,10 +1030,28 @@ def build():
 
     out_dir = "/vol/builds"
     os.makedirs(out_dir, exist_ok=True)
-    dest = os.path.join(out_dir, "app-debug.apk")
+    dest = os.path.join(out_dir, APK_OUTPUT)
     shutil.copy2(apk_path, dest)
     build_vol.commit()
     print(f"[build] APK copied to Volume: {dest}")
+
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=300,
+)
+def publish_apk():
+    """Copy the built APK into /vol/src so it is reachable via `modal volume get`
+    (the CLI otherwise sees a stale epoch of /vol/builds)."""
+    src = "/vol/builds/kali-gui-debug.apk"
+    if not os.path.exists(src):
+        print("[publish] No built APK at /vol/builds — run `build` first.", file=sys.stderr)
+        sys.exit(1)
+    dst = "/vol/src/kali-gui-debug.apk"
+    shutil.copy2(src, dst)
+    build_vol.commit()
+    print(f"[publish] APK published to {dst} ({os.path.getsize(dst) / (1024*1024):.1f} MB)")
 
 
 # ── Verify APK signature ─────────────────────────────────────────────────────
@@ -1017,17 +1093,200 @@ def list_volume():
                 print(f"  {fp}  (unreadable)")
 
 
+# ── Smart incremental build orchestrator ────────────────────────────────────
+_STATE_FILE = f"/vol/.build_state.{GITHUB_REPO.replace('/', '_')}.json"
+
+_PROOT_OUTPUTS = [
+    "app/src/main/assets/proot-static-aarch64",
+    "app/src/main/assets/proot-static-arm",
+    "app/src/main/assets/proot-static-i686",
+    "app/src/main/assets/proot-static-x86_64",
+    "app/src/main/assets/loader-static-aarch64",
+    "app/src/main/assets/loader-static-arm",
+    "app/src/main/assets/loader-static-i686",
+    "app/src/main/assets/loader-static-x86_64",
+]
+_NATIVE_COMPONENTS = {
+    "lib": {
+        "sources": ["app/src/main/cpp/usbfd_jni.c"],
+        "outputs": ["app/src/main/jniLibs/arm64-v8a/libusbfd_exporter.so"],
+        "fn": build_native_lib,
+    },
+    "bin": {
+        "sources": ["app/src/main/cpp/usb_bridge.c",
+                     "app/src/main/cpp/su_daemon.c",
+                     "app/src/main/cpp/su_wrapper.c"],
+        "outputs": ["app/src/main/assets/usb_bridge",
+                     "app/src/main/assets/su_daemon",
+                     "app/src/main/assets/su_wrapper"],
+        "fn": build_native_bin,
+    },
+    "usrtools": {
+        "sources": [],  # externí downloads; self-skip na outputs
+        "outputs": ["app/src/main/assets/usr/bin/sed",
+                    "app/src/main/assets/usr/bin/rsync",
+                    "app/src/main/assets/usr/bin/nano",
+                    "app/src/main/assets/usr/bin/rg"],
+        "fn": build_usrtools,
+    },
+}
+_GRADLE_SOURCES = [
+    "app/src/main/java", "app/src/main/res", "app/src/main/AndroidManifest.xml",
+    "app/build.gradle.kts", "build.gradle", "settings.gradle",
+    "settings.gradle.kts", "gradle.properties", "gradle/libs.versions.toml",
+    "app/proguard-rules.pro", "app/src/main/assets",
+]
+
+
+def _load_state():
+    try:
+        with open(_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(state):
+    with open(_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _outputs_exist(outputs, src_dir):
+    for o in outputs:
+        p = os.path.join(src_dir, o)
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            return False, o
+    return True, None
+
+
+def _git_changed(since_commit, src_dir="/vol/src"):
+    if not since_commit:
+        return None
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", src_dir, "diff", "--name-only", since_commit, "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().split()
+        return set(out)
+    except Exception:
+        return None
+
+
+def _touches(changed, prefixes):
+    if changed is None:
+        return None
+    for f in changed:
+        for p in prefixes:
+            if f == p or f.startswith(p + "/"):
+                return True
+    return False
+
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=2048,
+)
+def smart_build(force: bool = False):
+    """Chytrý inkrementální build (proot + native + gradle).
+
+    Nejdřív zkontroluje, jestli artefakty (proot/lib/bin) existují. Pokud ne →
+    build. Pokud ano → porovná změny zdrojáků přes `git diff` od posledního
+    buildu; beze změn → PŘESKOČENO, se změnou → rebuild jen dané komponenty.
+    -f/--force vynutí plný rebuild všeho.
+    """
+    src_dir = "/vol/src"
+    if not os.path.isdir(os.path.join(src_dir, ".git")):
+        print("[smart] /vol/src není git repo — spusť nejdřív `sync`.")
+        sys.exit(1)
+
+    current_commit = subprocess.check_output(
+        ["git", "-C", src_dir, "rev-parse", "HEAD"]).decode().strip()
+    state = _load_state()
+    print(f"[smart] current_commit={current_commit[:10]}  force={force}")
+
+    rebuilt = {}
+
+    # ── proot (externí zdroj → verze podle PROOT_TAG) ──
+    proot_state = state.get("proot", {})
+    proot_ok, missing = _outputs_exist(_PROOT_OUTPUTS, src_dir)
+    proot_need = force or (not proot_ok) or (proot_state.get("tag") != PROOT_TAG)
+    if proot_need:
+        why = ("force" if force else
+               ("chybí " + str(missing) if not proot_ok else
+                f"PROOT_TAG {proot_state.get('tag')} -> {PROOT_TAG}"))
+        print(f"[smart] proot: BUILD ({why})")
+        build_proot_static.remote()
+        rebuilt["proot"] = True
+    else:
+        print("[smart] proot: beze změn — PŘESKOČENO")
+        rebuilt["proot"] = False
+
+    # ── native (lib / bin / usrtools) ──
+    for name, comp in _NATIVE_COMPONENTS.items():
+        cstate = state.get(name, {})
+        ok, missing = _outputs_exist(comp["outputs"], src_dir)
+        changed = _git_changed(cstate.get("built_commit"), src_dir)
+        if name == "usrtools":
+            need = force or (not ok)
+            why = "force" if force else ("chybí " + str(missing) if not ok else "beze změn")
+        else:
+            touched = _touches(changed, comp["sources"]) if changed is not None else None
+            need = force or (not ok) or (touched is True) or (changed is None and ok)
+            why = ("force" if force else
+                   ("chybí " + str(missing) if not ok else
+                    ("změna: " + ", ".join(sorted(set(comp["sources"]) & changed)) if touched else
+                     ("baseline" if changed is None else "beze změn"))))
+        if need:
+            print(f"[smart] {name}: BUILD ({why})")
+            comp["fn"].remote()
+            rebuilt[name] = True
+        else:
+            print(f"[smart] {name}: beze změn — PŘESKOČENO")
+            rebuilt[name] = False
+
+    # ── gradle (APK) ──
+    gradle_state = state.get("gradle", {})
+    apk_path = os.path.join("/vol/builds", APK_OUTPUT)
+    apk_ok = os.path.exists(apk_path) and os.path.getsize(apk_path) > 0
+    g_changed = _git_changed(gradle_state.get("built_commit"), src_dir)
+    g_touched = _touches(g_changed, _GRADLE_SOURCES) if g_changed is not None else None
+    if force or any(rebuilt.values()) or (g_touched is True) or (g_changed is None and apk_ok):
+        why = ("force" if force else
+               ("rebuild nativních/proot" if any(rebuilt.values()) else
+                ("změna gradle zdrojů" if g_touched else "baseline")))
+        print(f"[smart] gradle: BUILD ({why})")
+        build.remote()
+        gradle_built = True
+    else:
+        print("[smart] gradle: beze změn — PŘESKOČENO")
+        gradle_built = False
+
+    # ── uložit stav ──
+    new_state = dict(state)
+    new_state["proot"] = {
+        "tag": PROOT_TAG,
+        "built_commit": current_commit if rebuilt.get("proot") else proot_state.get("built_commit"),
+    }
+    for name in _NATIVE_COMPONENTS:
+        cstate = state.get(name, {})
+        new_state[name] = {"built_commit": current_commit} if rebuilt.get(name) else cstate
+    new_state["gradle"] = {"built_commit": current_commit} if gradle_built else gradle_state
+    _save_state(new_state)
+    build_vol.commit()
+    print("[smart] Hotovo. Stav uložen na Volume.")
+
+
 @app.local_entrypoint()
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     if cmd == "init":
         init_keys.remote()
-    elif cmd == "upload":
-        upload_basic.remote()
-    elif cmd == "upload_force":
-        upload_force.remote()
-    elif cmd == "upload_clean":
-        upload_clean.remote()
+    elif cmd == "sync":
+        sync.remote()
+    elif cmd == "clean":
+        clean.remote()
     elif cmd == "native":
         build_native.remote()
     elif cmd == "proot":
@@ -1035,9 +1294,10 @@ def main():
     elif cmd == "build":
         build.remote()
     elif cmd == "all":
-        build_native.remote()
-        build.remote()
+        smart_build.remote(False)
+    elif cmd == "smart":
+        smart_build.remote(False)
     elif cmd == "list":
         list_volume.remote()
     else:
-        print("Usage: modal run modal_build.py [init|upload|upload_force|upload_clean|native|proot|build|all|list]")
+        print("Usage: modal run modal_build.py [init|sync|clean|native|proot|build|all|list]")
