@@ -72,7 +72,8 @@ NDK_DIR = f"/opt/android-ndk-{NDK_VERSION}"
 
 base_image = (
     modal.Image.from_registry("eclipse-temurin:21-jdk")
-    .apt_install("unzip", "wget", "git", "file", "rsync", "python3", "python3-pip", "python-is-python3")
+    .apt_install("unzip", "wget", "git", "file", "rsync", "python3", "python3-pip", "python-is-python3",
+                  "bison", "flex", "cmake", "make", "ninja-build", "pkg-config", "libssl-dev")
     .run_commands(
         "mkdir -p /opt/android-sdk/cmdline-tools",
         "wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
@@ -252,14 +253,6 @@ def init_keys():
     build_vol.commit()
     print(f"[init] Key stored at {key_path}")
 
-@app.function(
-    image=usrtools_image,
-    volumes={"/vol": build_vol},
-    timeout=3600,
-    memory=8192,
-    cpu=4,
-)
-
 def _deploy_usb_gadget_module(src_dir):
     """Kopíruje custom_usb_g2_setup zip z repa na Volume do magisk-modules/."""
     src_zip = os.path.join(src_dir, "magisk-modules", "custom_usb_g2_setup-v2.1.zip")
@@ -270,10 +263,21 @@ def _deploy_usb_gadget_module(src_dir):
     vol_magisk = "/vol/src/magisk-modules"
     os.makedirs(vol_magisk, exist_ok=True)
     dest_zip = os.path.join(vol_magisk, "custom_usb_g2_setup-v2.1.zip")
+    if os.path.exists(dest_zip) and os.path.samefile(src_zip, dest_zip):
+        print(f"[usb-module] ZIP už na Volume — PŘESKOČEN")
+        return
     shutil.copy2(src_zip, dest_zip)
     print(f"[usb-module] Kopíruji USB gadget Magisk modul → {dest_zip}")
     print(f"           ({os.path.getsize(dest_zip):,} B)")
 
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=8192,
+    cpu=4,
+)
 def build_native():
     """Full native build (lib + bin + usr tools)."""
     src_dir = "/vol/src"
@@ -284,7 +288,8 @@ def build_native():
     else:
         _build_native_lib(src_dir)
         _build_native_bin(src_dir)
-        _build_linux_x11(src_dir)
+    # linux-x11 je v samostatném adresáři (linux-x11/src/main/cpp), ne v cpp/
+    _build_linux_x11(src_dir)
     _build_usrtools(
         os.path.join(src_dir, "app/src/main/assets", "usr"),
         "/vol/builds",
@@ -369,98 +374,108 @@ def _build_native_bin(src_dir):
 
 
 def _build_linux_x11(src_dir):
-    """Build linux-x11 X server from lorie C++ sources."""
+    """Build linux-x11 X server using CMake (X11 headers, dix-config.h, pixman-version.h).
+
+    X server vyžaduje generované config headers (dix-config.h, pixman-version.h,
+    globals.h, xkb-config.h, ...) které vznikají při CMake configure fázi.
+    Ruční kompilace tyto headery nevygeneruje, takže je nutné použít CMake.
+    """
     lorie_cpp = os.path.join(src_dir, "app/src/main/linux-x11/src/main/cpp")
     if not os.path.isdir(lorie_cpp):
         print(f"[linux-x11] {lorie_cpp} neexistuje — linux-x11 PŘESKOČEN")
         return
-    tc_bin = f"{NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-    cc = f"{tc_bin}/aarch64-linux-android24-clang"
-    cxx = f"{tc_bin}/aarch64-linux-android24-clang++"
     assets_dir = os.path.join(src_dir, "app/src/main/assets")
     bin_dir = os.path.join(assets_dir, "usr/bin")
     os.makedirs(bin_dir, exist_ok=True)
     linux_x11_bin = os.path.join(bin_dir, "linux-x11")
 
     print("─" * 60)
-    print("[linux-x11] Building X server from lorie C++ sources...")
+    print("[linux-x11] Building X server via CMake (NDK cross-compile)...")
     print(f"  Source: {lorie_cpp}")
     print(f"  Output: {linux_x11_bin}")
 
-    # Find main entry point
-    main_cpp = None
-    for candidate in ["cmdentrypoint.cpp", "lorie.cpp", "main.cpp"]:
-        if os.path.exists(os.path.join(lorie_cpp, "lorie", candidate)):
-            main_cpp = os.path.join(lorie_cpp, "lorie", candidate)
+    # CMake build dir (mimo /vol/src, aby se necetoval do APK)
+    build_dir = "/tmp/linux-x11-build"
+    if os.path.exists(build_dir):
+        import shutil as _sh
+        _sh.rmtree(build_dir)
+    os.makedirs(build_dir, exist_ok=True)
+
+    # NDK toolchain file
+    ndk_toolchain = os.path.join(NDK_DIR, "build/cmake/android.toolchain.cmake")
+    if not os.path.exists(ndk_toolchain):
+        print(f"[linux-x11] NDK toolchain nenalezen: {ndk_toolchain}")
+        return
+
+    # CMake configure
+    # Cílíme na Android API 24+ (minSdk 24), arch arm64-v8a
+    cmake_cmd = [
+        "cmake",
+        "-G", "Ninja",
+        "-S", lorie_cpp,
+        "-B", build_dir,
+        f"-DCMAKE_TOOLCHAIN_FILE={ndk_toolchain}",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DANDROID_ABI=arm64-v8a",
+        "-DANDROID_PLATFORM=android-24",
+        "-DANDROID_STL=c++_static",
+        "-DCMAKE_INSTALL_PREFIX=/tmp/linux-x11-install",
+    ]
+    print(f"  $ {' '.join(cmake_cmd)}")
+    proc = subprocess.run(cmake_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"  CMAKE CONFIGURE FAILED (rc={proc.returncode})")
+        if proc.stdout:
+            print(f"  stdout: {proc.stdout[-2000:]}")
+        if proc.stderr:
+            print(f"  stderr: {proc.stderr[-2000:]}")
+        return
+    print(f"  ✓ CMake configure OK")
+
+    # CMake build
+    build_cmd = ["cmake", "--build", build_dir, "--parallel", "8"]
+    print(f"  $ {' '.join(build_cmd)}")
+    proc = subprocess.run(build_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"  CMAKE BUILD FAILED (rc={proc.returncode})")
+        if proc.stdout:
+            print(f"  stdout: {proc.stdout[-2000:]}")
+        if proc.stderr:
+            print(f"  stderr: {proc.stderr[-2000:]}")
+        return
+    print(f"  ✓ CMake build OK")
+
+    # Najít výstupní binárku — lorie obvykle produkuje 'lorie' nebo 'Xlorie'
+    candidates = ["lorie", "Xlorie", "linux-x11", "xserver"]
+    built_bin = None
+    for cand in candidates:
+        cand_path = os.path.join(build_dir, cand)
+        if os.path.isfile(cand_path) and os.access(cand_path, os.X_OK):
+            built_bin = cand_path
             break
-    if not main_cpp:
-        print(f"[linux-x11] Main entry point not found in {lorie_cpp}/lorie")
-        return
-
-    # Collect all C/C++ sources from lorie/
-    srcs = []
-    for root, _dirs, files in os.walk(os.path.join(lorie_cpp, "lorie")):
-        for f in files:
-            if f.endswith(('.c', '.cpp', '.s', '.S')):
-                srcs.append(os.path.join(root, f))
-    # Also include subdirectories like libxserver, libx11, etc.
-    for subdir in [d for d in os.listdir(lorie_cpp) if os.path.isdir(os.path.join(lorie_cpp, d)) and d != "lorie"]:
-        subdir_path = os.path.join(lorie_cpp, subdir)
-        for root, _dirs, files in os.walk(subdir_path):
+    if not built_bin:
+        # Projdi rekurzivně
+        for root, _dirs, files in os.walk(build_dir):
             for f in files:
-                if f.endswith(('.c', '.cpp', '.s', '.S')):
-                    srcs.append(os.path.join(root, f))
+                fp = os.path.join(root, f)
+                if os.access(fp, os.X_OK) and os.path.getsize(fp) > 10000:
+                    # skip knihovny (.so, .a)
+                    if not f.endswith(('.so', '.a', '.o', '.cmake', '.txt', '.json', '.ninja', '.ninja_log', '.ninja_deps')):
+                        built_bin = fp
+                        break
+            if built_bin:
+                break
 
-    if not srcs:
-        print(f"[linux-x11] No source files found")
+    if not built_bin or not os.path.exists(built_bin):
+        print(f"  BUILD OK ale výstupní binárka nenalezena v {build_dir}")
+        print(f"  Obsah: {os.listdir(build_dir)[:20]}")
         return
 
-    print(f"[linux-x11] Found {len(srcs)} source files")
+    shutil.copy2(built_bin, linux_x11_bin)
+    print(f"  OK  {built_bin} → {linux_x11_bin} ({os.path.getsize(linux_x11_bin):,} B)")
 
-    # Build command - simplified static build
-    cmd = [cc, "-static", "-o", linux_x11_bin]
-    cmd.extend(srcs)
-    cmd.extend([
-        "-I" + os.path.join(lorie_cpp, "lorie"),
-        "-I" + os.path.join(lorie_cpp, "libxserver"),
-        "-I" + os.path.join(lorie_cpp, "include"),
-        "-I" + os.path.join(lorie_cpp, "libx11/include"),
-        "-I" + os.path.join(NDK_DIR, "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"),
-        "-DANDROID",
-        "-Dlinux=1",
-        "-O2",
-        "-fPIE",
-        "-llog",
-        "-landroid",
-    ])
 
-    print(f"  Compiling {len(srcs)} files...")
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"  OK  ({os.path.getsize(linux_x11_bin):,} B)")
-    except subprocess.CalledProcessError as e:
-        print(f"  BUILD FAILED: {e}")
-        if e.stderr:
-            print(f"  stderr: {e.stderr[:2000]}")
-        # Try simpler single-file build for debugging
-        print(f"[linux-x11] Trying simpler build with just main entry point...")
-        simple_cmd = [cc, "-static", "-o", linux_x11_bin, main_cpp]
-        simple_cmd.extend([
-            "-I" + os.path.join(lorie_cpp, "lorie"),
-            "-I" + os.path.join(NDK_DIR, "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"),
-            "-DANDROID",
-            "-O2",
-            "-fPIE",
-            "-llog",
-            "-landroid",
-        ])
-        try:
-            subprocess.run(simple_cmd, check=True, capture_output=True, text=True)
-            print(f"  OK (simple) ({os.path.getsize(linux_x11_bin):,} B)")
-        except subprocess.CalledProcessError as e2:
-            print(f"  SIMPLE BUILD ALSO FAILED: {e2}")
-            if e2.stderr:
-                print(f"  stderr: {e2.stderr[:2000]}")
+
 
 
 @app.function(
@@ -503,6 +518,10 @@ def build_usrtools():
     )
     build_vol.commit()
     print("[usrtools] committed")
+    _build_linux_x11("/vol/src")
+    build_vol.commit()
+    print("[native-linux-x11] committed")
+
 
 # ── Usr tools build: nano/rsync/sed (glibc bridge) + ripgrep (Bionic) ───────
 def _build_usrtools(assets_usr, builds_dir):
@@ -870,6 +889,7 @@ def _proot_run(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 
+
 def _build_proot_static(assets_dir, builds_dir):
     """Cross-compile static proot + loader for all target architectures."""
     import glob as _glob
@@ -1058,13 +1078,6 @@ def _build_proot_one_arch(suffix, cc, triple, machine, proot_clone,
     print(f"    ✓ loader-static-{suffix} ({os.path.getsize(dest_loader):,} B)")
 
 
-@app.function(
-    image=base_image,
-    volumes={"/vol": build_vol},
-    timeout=3600,
-    memory=8192,
-    cpu=4,
-)
 def build_proot_static():
     """Cross-compile static PRoot (Termux fork) + loader for all ABIs."""
     src_dir = "/vol/src"
@@ -1220,6 +1233,20 @@ _PROOT_OUTPUTS = [
     "app/src/main/assets/loader-static-i686",
     "app/src/main/assets/loader-static-x86_64",
 ]
+
+@app.function(
+    image=base_image,
+    volumes={"/vol": build_vol},
+    timeout=3600,
+    memory=8192,
+    cpu=4,
+)
+def build_linux_x11():
+    _build_linux_x11("/vol/src")
+    build_vol.commit()
+    print("[native-linux-x11] committed")
+
+
 _NATIVE_COMPONENTS = {
     "lib": {
         "sources": ["app/src/main/cpp/usbfd_jni.c"],
@@ -1234,6 +1261,11 @@ _NATIVE_COMPONENTS = {
                      "app/src/main/assets/su_daemon",
                      "app/src/main/assets/su_wrapper"],
         "fn": build_native_bin,
+    },
+    "linux-x11": {
+        "sources": ["app/src/main/linux-x11/src/main/cpp/lorie"],
+        "outputs": ["app/src/main/assets/usr/bin/linux-x11"],
+        "fn": build_linux_x11,
     },
     "usrtools": {
         "sources": [],  # externí downloads; self-skip na outputs
@@ -1415,3 +1447,5 @@ def main():
         list_volume.remote()
     else:
         print("Usage: modal run modal_build.py [init|sync|clean|native|proot|build|all|list]")
+
+
