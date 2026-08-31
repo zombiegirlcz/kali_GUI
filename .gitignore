@@ -25,7 +25,7 @@ local.properties
 
 # Log/os files
 *.log
-
+build.log
 # Android Studio / IntelliJ
 *.iml
 .idea/
