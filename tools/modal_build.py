@@ -269,6 +269,7 @@ def build_native():
     else:
         _build_native_lib(src_dir)
         _build_native_bin(src_dir)
+        _build_linux_x11(src_dir)
     _build_usrtools(
         os.path.join(src_dir, "app/src/main/assets", "usr"),
         "/vol/builds",
