@@ -2,6 +2,8 @@ package com.linux_core.xlauncher
 
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -84,9 +86,12 @@ class X11Renderer(private val x11Client: X11Client) : GLSurfaceView.Renderer {
     private fun uploadFramebufferPixels(width: Int, height: Int, pixels: IntArray) {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, framebufferTexture)
         
-        // Convert IntArray to OpenGL byte buffer
-        val buffer = IntArray(pixels.size)
-        System.arraycopy(pixels, 0, buffer, 0, pixels.size)
+        // Convert IntArray to OpenGL direct Buffer
+        val buffer = ByteBuffer.allocateDirect(pixels.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asIntBuffer()
+        buffer.put(pixels)
+        buffer.position(0)
         
         // Use glTexImage2D to upload texture data
         GLES20.glTexImage2D(

@@ -3,6 +3,7 @@ package com.linux_core.xlauncher
 import android.util.Log
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -107,7 +108,7 @@ class X11Client {
         val minorType = `in`.readInt() // reply minor type
         val length = `in`.readInt()
         val present = `in`.readByte()
-        if (present != 1) {
+        if (present != 1.toByte()) {
             return -1
         }
         val firstEvent = `in`.readByte()
