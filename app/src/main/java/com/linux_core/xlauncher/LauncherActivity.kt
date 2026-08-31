@@ -1,28 +1,30 @@
 package com.linux_core.xlauncher
 
 import android.app.Activity
-import android.graphics.Color
+import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup.LayoutParams
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.graphics.Color
 
 /**
  * Standalone X11 desktop launcher.
  *
- * Connects to the Xvnc X server started by the host app (`nh desktop start`,
- * display :1) over the VNC port (5901) and renders the framebuffer. This app
- * only renders — the actual X server and desktop session live in the proot
+ * Connects to the Linux-X11 X server started by the host app (`nh desktop start`,
+ * display :1) over the X11 port (6000) and renders the framebuffer using OpenGL ES.
+ * This app only renders — the actual X server and desktop session live in the proot
  * guest managed by `com.linux_core`.
  *
- * Connection overrides can be passed via intent extras: host, port, password.
+ * Connection overrides can be passed via intent extras: host, port.
  */
 class LauncherActivity : Activity() {
 
-    private lateinit var view: FramebufferView
+    private lateinit var glView: GLSurfaceView
     private lateinit var status: TextView
-    private var client: VncClient? = null
+    private var client: X11Client? = null
+    private var renderer: X11Renderer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,31 +33,26 @@ class LauncherActivity : Activity() {
                         or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                         or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
 
-        view = FramebufferView(this)
+        glView = GLSurfaceView(this)
+        glView.setEGLContextClientVersion(2)
+
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 16f
         }
 
         val root = FrameLayout(this).apply {
-            addView(view, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(glView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(status, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
             ).apply { setMargins(24, 24, 24, 24) })
         }
         setContentView(root)
 
-        view.pointerListener = object : FramebufferView.PointerListener {
-            override fun onPointer(fbX: Int, fbY: Int, mask: Int) {
-                client?.pointerEvent(fbX, fbY, mask)
-            }
-        }
-
         val config = intent.extras?.let { e ->
             ConnectionConfig(
                 e.getString("host") ?: ConnectionConfig.DEFAULT.host,
-                e.getInt("port", ConnectionConfig.DEFAULT.port),
-                e.getString("password") ?: ConnectionConfig.DEFAULT.password
+                e.getInt("port", ConnectionConfig.DEFAULT.port)
             )
         } ?: ConnectionConfig.DEFAULT
 
@@ -65,20 +62,20 @@ class LauncherActivity : Activity() {
 
     private fun startConnection(config: ConnectionConfig) {
         Thread {
-            val c = VncClient()
+            val c = X11Client()
             client = c
-            c.connect(config, object : VncClient.Listener {
+
+            val listener = object : X11Client.Listener {
                 override fun onConnected(width: Int, height: Int) = runOnUiThread {
-                    view.setFramebufferSize(width, height)
+                    // Initialize renderer with framebuffer dimensions
+                    renderer = X11Renderer(c)
+                    glView.setRenderer(renderer)
+                    glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
                     status.visibility = View.GONE
                 }
 
-                override fun onFramebuffer(x: Int, y: Int, w: Int, h: Int, pixels: IntArray) {
-                    view.updateRegion(x, y, w, h, pixels)
-                }
-
-                override fun onDesktopSize(w: Int, h: Int) = runOnUiThread {
-                    view.setFramebufferSize(w, h)
+                override fun onFramebuffer(width: Int, height: Int, pixels: IntArray) {
+                    renderer?.updateFramebuffer(width, height, pixels)
                 }
 
                 override fun onDisconnected() = runOnUiThread {
@@ -92,7 +89,9 @@ class LauncherActivity : Activity() {
                     status.visibility = View.VISIBLE
                     status.text = "Error: ${t.message}"
                 }
-            })
+            }
+
+            c.connect(config, listener)
         }.start()
     }
 
@@ -100,5 +99,20 @@ class LauncherActivity : Activity() {
         super.onDestroy()
         client?.disconnect()
         client = null
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        // Forward touch events to X11 client
+        client?.let { c ->
+            val x = (event.x * (renderer?.framebufferWidth ?: 1) / glView.width).toInt()
+            val y = (event.y * (renderer?.framebufferHeight ?: 1) / glView.height).toInt()
+
+            when (event.action) {
+                android.view.MotionEvent.ACTION_DOWN -> c.sendPointerEvent(x, y, 1)
+                android.view.MotionEvent.ACTION_UP -> c.sendPointerEvent(x, y, 0)
+                android.view.MotionEvent.ACTION_MOVE -> c.sendPointerEvent(x, y, 1)
+            }
+        }
+        return true
     }
 }

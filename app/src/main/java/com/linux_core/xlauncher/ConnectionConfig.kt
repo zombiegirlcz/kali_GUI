@@ -1,21 +1,21 @@
 package com.linux_core.xlauncher
 
 /**
- * Connection target for the Xvnc X server started by the host app
- * (`nh desktop start` → Xvnc :1).
+ * Connection target for the Linux-X11 X server started by the host app
+ * (`nh desktop start` → linux-x11 :1).
  *
- * The launcher connects to the VNC port (5901) rather than the raw X11 port (6001):
- * RFB gives us incremental framebuffer updates (efficient) and built-in input
- * events, whereas an X11-client framebuffer poll via XGetImage would be slow and
- * cross-UID MIT-SHM would not work.
+ * The launcher connects to the X11 port (6000) where the X server listens.
+ * MIT-SHM extension is used for efficient framebuffer sharing when available.
  */
 data class ConnectionConfig(
     val host: String,
-    val port: Int,
-    val password: String
+    val port: Int
 ) {
     companion object {
-        /** Defaults match `nh desktop start` (Xvnc :1, 1280x720, pw kali_operator). */
-        val DEFAULT = ConnectionConfig("127.0.0.1", 5901, "kali_operator")
+        /** Defaults match `nh desktop start` (linux-x11 :1, display 6000). */
+        val DEFAULT = ConnectionConfig("127.0.0.1", 6000)
+
+        // Default display number for X server
+        const val DEFAULT_DISPLAY = 1
     }
 }

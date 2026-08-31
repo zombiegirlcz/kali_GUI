@@ -62,6 +62,8 @@ build_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 # prepisoval default a GUI/assistant by klonovaly core. Proto literál.
 GITHUB_REPO = "zombiegirlcz/kali_GUI"
 GITHUB_BRANCH = "master"
+TERMUX_X11_REPO = "termux/termux-x11"
+TERMUX_X11_DIR = "termux-x11"
 
 
 # ── Image with Android SDK + JDK 21 + NDK ────────────────────────────────────
@@ -347,6 +349,101 @@ def _build_native_bin(src_dir):
         print(f"  {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         print(f"  OK  ({os.path.getsize(wrapper_bin_path):,} B)")
+
+
+def _build_linux_x11(src_dir):
+    """Build linux-x11 X server from lorie C++ sources."""
+    lorie_cpp = os.path.join(src_dir, "app/src/main/linux-x11/src/main/cpp")
+    if not os.path.isdir(lorie_cpp):
+        print(f"[linux-x11] {lorie_cpp} neexistuje — linux-x11 PŘESKOČEN")
+        return
+    tc_bin = f"{NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    cc = f"{tc_bin}/aarch64-linux-android24-clang"
+    cxx = f"{tc_bin}/aarch64-linux-android24-clang++"
+    assets_dir = os.path.join(src_dir, "app/src/main/assets")
+    bin_dir = os.path.join(assets_dir, "usr/bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    linux_x11_bin = os.path.join(bin_dir, "linux-x11")
+
+    print("─" * 60)
+    print("[linux-x11] Building X server from lorie C++ sources...")
+    print(f"  Source: {lorie_cpp}")
+    print(f"  Output: {linux_x11_bin}")
+
+    # Find main entry point
+    main_cpp = None
+    for candidate in ["cmdentrypoint.cpp", "lorie.cpp", "main.cpp"]:
+        if os.path.exists(os.path.join(lorie_cpp, "lorie", candidate)):
+            main_cpp = os.path.join(lorie_cpp, "lorie", candidate)
+            break
+    if not main_cpp:
+        print(f"[linux-x11] Main entry point not found in {lorie_cpp}/lorie")
+        return
+
+    # Collect all C/C++ sources from lorie/
+    srcs = []
+    for root, _dirs, files in os.walk(os.path.join(lorie_cpp, "lorie")):
+        for f in files:
+            if f.endswith(('.c', '.cpp', '.s', '.S')):
+                srcs.append(os.path.join(root, f))
+    # Also include subdirectories like libxserver, libx11, etc.
+    for subdir in [d for d in os.listdir(lorie_cpp) if os.path.isdir(os.path.join(lorie_cpp, d)) and d != "lorie"]:
+        subdir_path = os.path.join(lorie_cpp, subdir)
+        for root, _dirs, files in os.walk(subdir_path):
+            for f in files:
+                if f.endswith(('.c', '.cpp', '.s', '.S')):
+                    srcs.append(os.path.join(root, f))
+
+    if not srcs:
+        print(f"[linux-x11] No source files found")
+        return
+
+    print(f"[linux-x11] Found {len(srcs)} source files")
+
+    # Build command - simplified static build
+    cmd = [cc, "-static", "-o", linux_x11_bin]
+    cmd.extend(srcs)
+    cmd.extend([
+        "-I" + os.path.join(lorie_cpp, "lorie"),
+        "-I" + os.path.join(lorie_cpp, "libxserver"),
+        "-I" + os.path.join(lorie_cpp, "include"),
+        "-I" + os.path.join(lorie_cpp, "libx11/include"),
+        "-I" + os.path.join(NDK_DIR, "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"),
+        "-DANDROID",
+        "-Dlinux=1",
+        "-O2",
+        "-fPIE",
+        "-llog",
+        "-landroid",
+    ])
+
+    print(f"  Compiling {len(srcs)} files...")
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"  OK  ({os.path.getsize(linux_x11_bin):,} B)")
+    except subprocess.CalledProcessError as e:
+        print(f"  BUILD FAILED: {e}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr[:2000]}")
+        # Try simpler single-file build for debugging
+        print(f"[linux-x11] Trying simpler build with just main entry point...")
+        simple_cmd = [cc, "-static", "-o", linux_x11_bin, main_cpp]
+        simple_cmd.extend([
+            "-I" + os.path.join(lorie_cpp, "lorie"),
+            "-I" + os.path.join(NDK_DIR, "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"),
+            "-DANDROID",
+            "-O2",
+            "-fPIE",
+            "-llog",
+            "-landroid",
+        ])
+        try:
+            subprocess.run(simple_cmd, check=True, capture_output=True, text=True)
+            print(f"  OK (simple) ({os.path.getsize(linux_x11_bin):,} B)")
+        except subprocess.CalledProcessError as e2:
+            print(f"  SIMPLE BUILD ALSO FAILED: {e2}")
+            if e2.stderr:
+                print(f"  stderr: {e2.stderr[:2000]}")
 
 
 @app.function(
