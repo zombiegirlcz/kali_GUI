@@ -1,21 +1,21 @@
 package com.linux_core.xlauncher
 
 /**
- * Connection target for the Linux-X11 X server started by the host app
- * (`nh desktop start` → linux-x11 :1).
+ * Where to find the X server run by the guest.
  *
- * The launcher connects to the X11 port (6000) where the X server listens.
- * MIT-SHM extension is used for efficient framebuffer sharing when available.
+ * `nh desktop start` boots Xvfb on display `:0` with `-listen tcp`, which makes
+ * it listen on TCP port 6000 (6000 + display number). The proot guest shares
+ * the Android network namespace, so the host app reaches it on loopback and no
+ * `adb reverse` is needed.
  */
 data class ConnectionConfig(
     val host: String,
     val port: Int
 ) {
     companion object {
-        /** Defaults match `nh desktop start` (linux-x11 :1, display 6000). */
         val DEFAULT = ConnectionConfig("127.0.0.1", 6000)
 
-        // Default display number for X server
-        const val DEFAULT_DISPLAY = 1
+        /** Display number used by `nh desktop start`; TCP port = 6000 + this. */
+        const val DEFAULT_DISPLAY = 0
     }
 }

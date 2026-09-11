@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">NetHunter X11 Launcher</string>
+
+    <string name="status_connecting">Connecting to %1$s:%2$d …</string>
+    <string name="status_disconnected">Disconnected.</string>
+
+    <string name="error_no_server">Cannot reach the X server.\n\nStart the desktop inside the guest first:\n  nh desktop start\n\n(%1$s)</string>
+    <string name="error_timeout">Timed out talking to the X server.\n\n(%1$s)</string>
+    <string name="error_generic">Error: %1$s</string>
 </resources>

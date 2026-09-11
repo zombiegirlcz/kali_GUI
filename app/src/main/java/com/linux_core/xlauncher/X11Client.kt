@@ -1,22 +1,40 @@
 package com.linux_core.xlauncher
 
 import android.util.Log
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Minimal X11 protocol client implementing MIT-SHM and PutImage for efficient framebuffer rendering.
+ * Small but *real* X11 protocol client.
  *
- * X11 protocol details:
- * - Big-endian 4-byte packets: length(4) + type(4)
- * - Major requests (client → server)
- * - Major replies (server → client) 
- * - Events (server → client)
- * - MIT-SHM extension for shared memory framebuffer
+ * It implements just enough of the core protocol and the XTEST extension to
+ * drive the remote desktop that `nh desktop start` runs inside the proot
+ * guest (Xvfb on display :0, TCP 127.0.0.1:6000):
+ *
+ *   - connection setup (handshake) + setup-reply parsing
+ *   - `GetImage` (ZPixmap) on the root window -> framebuffer polling
+ *   - XTEST `FakeInput` -> pointer / button / key injection
+ *
+ * Notes on the wire format (all of this was verified against Xvfb 21.1.16):
+ *
+ *  * The setup request is 12 bytes and every field after the first must use
+ *    the byte order announced in the first byte. We announce `'B'` (MSB first)
+ *    so [DataInputStream]/[DataOutputStream] can be used as-is, because they
+ *    are big-endian by default.
+ *
+ *  * `GetImage` is the portable way to grab the screen. MIT-SHM is advertised
+ *    by the server but is *not* usable here: it passes a shared-memory id over
+ *    the socket and cannot cross a TCP connection (FD passing is required).
+ *
+ *  * XTEST `FakeInput` is request opcode 132 / minor opcode **2** and its body
+ *    is a complete 32-byte `xEvent` (so the request is 36 bytes, length 9).
+ *    `rootX`/`rootY` are INT16 at event offsets 20/22.
  */
 class X11Client {
 
@@ -30,371 +48,445 @@ class X11Client {
     private var socket: Socket? = null
     private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
-    private var running = false
+    private val running = AtomicBoolean(false)
 
-    @Volatile private var fbWidth = 0
-    @Volatile private var fbHeight = 0
-    @Volatile private var windowId = 0
+    /** Protects request writes: the frame loop and the UI thread share the socket. */
+    private val writeLock = Any()
 
+    /** Root window id of screen 0, taken from the setup reply. */
+    @Volatile
+    var rootWindow: Int = 0
+        private set
+
+    @Volatile
+    var screenWidth: Int = 0
+        private set
+
+    @Volatile
+    var screenHeight: Int = 0
+        private set
+
+    /** Bits per pixel of the root window's pixmap format (24/32). */
+    private var bitsPerPixel = 32
+
+    /** True when the server sends ZPixmap data least-significant-byte first. */
+    private var imageLsbFirst = false
+
+    /** Double buffered framebuffers, swapped on every published frame. */
+    private var frameA: IntArray? = null
+    private var frameB: IntArray? = null
+    private var publishA = true
+
+    /**
+     * Connects, performs the setup handshake and then blocks in the framebuffer
+     * polling loop. Call from a background thread.
+     */
     fun connect(config: ConnectionConfig, listener: Listener) {
         try {
             val sock = Socket()
-            sock.connect(InetSocketAddress(config.host, config.port), 5000)
             sock.tcpNoDelay = true
+            sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
+            sock.soTimeout = READ_TIMEOUT_MS
             socket = sock
-            input = DataInputStream(sock.getInputStream())
-            output = DataOutputStream(sock.getOutputStream())
-            running = true
+            input = DataInputStream(BufferedInputStream(sock.getInputStream(), 64 * 1024))
+            output = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
+            running.set(true)
+
             handshake(listener)
-            receiveLoop(listener)
+            frameLoop(listener)
         } catch (t: Throwable) {
-            Log.e(TAG, "X11 connection failed", t)
-            listener.onError(t)
+            // A deliberate disconnect() must not surface as an error.
+            if (running.get()) {
+                Log.e(TAG, "X11 session failed", t)
+                listener.onError(t)
+            }
         } finally {
-            disconnect()
+            closeQuietly()
             listener.onDisconnected()
         }
     }
 
+    /* ------------------------------------------------------------------ */
+    /* Handshake                                                          */
+    /* ------------------------------------------------------------------ */
+
     private fun handshake(listener: Listener) {
-        val `in` = input!!
         val out = output!!
+        val inp = input!!
 
-        // 1) X11 protocol version handshake (X11 protocol 11)
-        out.writeInt(0) // byte order (MSB first)
-        out.writeInt(11) // protocol major version
-        out.writeInt(0) // protocol minor version
-        out.writeInt(0) // authorization protocol length
-        out.writeInt(0) // authorization protocol data (no auth)
-        out.flush()
-
-        // Read server reply
-        val major = `in`.readInt()
-        val minor = `in`.readInt()
-        val length = `in`.readInt()
-
-        // 2) Request MIT-SHM extension
-        val shmCookie = requestExtension("MIT-SHM")
-        if (shmCookie == -1) {
-            throw IOException("MIT-SHM extension not supported")
+        synchronized(writeLock) {
+            out.writeByte(0x42)   // 'B' -> MSB first
+            out.writeByte(0)      // unused
+            out.writeShort(11)    // protocol major
+            out.writeShort(0)     // protocol minor
+            out.writeShort(0)     // auth protocol name length
+            out.writeShort(0)     // auth protocol data length
+            out.writeShort(0)     // unused
+            out.flush()
         }
 
-        // 3) Create root window
-        windowId = createWindow(0, 0, 1280, 720, 0)
+        val status = inp.readUnsignedByte()
 
-        // 4) Request normal events
-        setupEvents()
-
-        // 5) Map window (make it visible)
-        mapWindow(windowId)
-
-        Log.i(TAG, "X11 handshake completed, root window=${windowId}")
-    }
-
-    private fun requestExtension(name: String): Int {
-        val `in` = input!!
-        val out = output!!
-
-        // Send extension request
-        out.writeInt(128) // Major request: VendorSpecific
-        out.writeInt(0) // minor opcode: 0
-        out.writeInt(0) // length
-        out.writeInt(name.length + 1) // including null terminator
-        out.writeBytes(name)
-        out.writeByte(0) // null terminator
-        out.flush()
-
-        // Read reply
-        val minorType = `in`.readInt() // reply minor type
-        val length = `in`.readInt()
-        val present = `in`.readByte()
-        if (present != 1.toByte()) {
-            return -1
+        // A "Failed" reply has a different shape than a successful one:
+        //   status(1) reason-length(1) major(2) minor(2) reason(n) pad
+        if (status == FAILED) {
+            val reasonLen = inp.readUnsignedByte()
+            inp.readUnsignedShort()
+            inp.readUnsignedShort()
+            val reason = ByteArray(reasonLen)
+            inp.readFully(reason)
+            inp.skipBytes(pad4(reasonLen))
+            throw IOException("X server refused the connection: ${String(reason)}")
         }
-        val firstEvent = `in`.readByte()
-        val firstError = `in`.readByte()
-        val majorOpcode = `in`.readByte()
-        return majorOpcode.toInt()
-    }
+        if (status != SUCCESS) {
+            throw IOException("X server requested authentication (status $status)")
+        }
 
-    private fun createWindow(parent: Int, x: Int, y: Int, w: Int, h: Int): Int {
-        val `in` = input!!
-        val out = output!!
+        inp.readUnsignedByte()                 // unused
+        val major = inp.readUnsignedShort()
+        val minor = inp.readUnsignedShort()
+        val extraWords = inp.readUnsignedShort()
 
-        // CreateWindow request
-        out.writeInt(1) // Major request: CreateWindow
-        out.writeInt(8) // Minor opcode: CreateWindow
-        out.writeInt(20) // length
-        out.writeInt(0) // depth
-        out.writeInt(0) // visual id
-        out.writeInt(1) // parent window id
-        out.writeInt(x) // x position
-        out.writeInt(y) // y position
-        out.writeInt(w) // width
-        out.writeInt(h) // height
-        out.writeInt(0) // border width
-        out.writeInt(1) // class: CopyFromParent (1)
-        out.writeInt(0) // visual id
-        out.writeInt(0) // value mask
-        out.flush()
+        if (extraWords <= 0) {
+            throw IOException("X server returned an empty setup reply")
+        }
 
-        // Read reply
-        val replyMinorType = `in`.readInt()
-        val replyLength = `in`.readInt()
-        val windowId = `in`.readInt()
-        return windowId
-    }
+        val setup = ByteArray(extraWords * 4)
+        inp.readFully(setup)
+        parseSetup(setup)
 
-    private fun mapWindow(windowId: Int) {
-        val `in` = input!!
-        val out = output!!
+        Log.i(TAG, "handshake ok (v$major.$minor): root=${hex(rootWindow)} " +
+                "${screenWidth}x$screenHeight depth bpp=$bitsPerPixel lsb=$imageLsbFirst")
 
-        // MapWindow request
-        out.writeInt(5) // Major request: MapWindow
-        out.writeInt(1) // Minor opcode: MapWindow
-        out.writeInt(2) // length
-        out.writeInt(windowId) // window id
-        out.flush()
-
-        // Read reply
-        val replyMinorType = `in`.readInt()
-        val replyLength = `in`.readInt()
-    }
-
-    private fun setupEvents() {
-        val `in` = input!!
-        val out = output!!
-
-        // ChangeWindowAttributes to enable event delivery
-        out.writeInt(2) // Major request: ChangeWindowAttributes
-        out.writeInt(1) // Minor opcode: ChangeWindowAttributes
-        out.writeInt(11) // length
-        out.writeInt(1) // window id: root window (will be set after create)
-        out.writeInt(15) // value mask: eventMask
-        out.writeInt(1) // event mask: SubstructureNotifyMask + ExposureMask + KeyPressMask + KeyReleaseMask + ButtonPressMask + ButtonReleaseMask + PointerMotionMask + PointerMotionHintMask + Button1MotionMask + Button2MotionMask + Button3MotionMask + Button4MotionMask + Button5MotionMask + KeymapStateMask
-        out.flush()
-
-        // Read reply
-        val replyMinorType = `in`.readInt()
-        val replyLength = `in`.readInt()
-    }
-
-    private fun receiveLoop(listener: Listener) {
-        Thread {
-            try {
-                val `in` = input!!
-                while (running) {
-                    // Read packet header: length + type
-                    val length = `in`.readInt()
-                    val type = `in`.readInt()
-
-                    when (type) {
-                        // CreateNotify event (window created)
-                        33 -> {
-                            val replyLength = `in`.readInt()
-                            val windowId = `in`.readInt()
-                            val x = `in`.readInt()
-                            val y = `in`.readInt()
-                            val width = `in`.readInt()
-                            val height = `in`.readInt()
-                            val borderWidth = `in`.readInt()
-                            val override = `in`.readInt()
-                            val parent = `in`.readInt()
-                            // Skip padding
-                            `in`.skipBytes((replyLength - 9) * 4)
-                        }
-
-                        // ConfigureNotify event (window configured)
-                        27 -> {
-                            val replyLength = `in`.readInt()
-                            val event = `in`.readInt()
-                            val window = `in`.readInt()
-                            val x = `in`.readInt()
-                            val y = `in`.readInt()
-                            val width = `in`.readInt()
-                            val height = `in`.readInt()
-                            val borderWidth = `in`.readInt()
-                            val aboveSib = `in`.readInt()
-                            val overrideRedirect = `in`.readInt()
-                            val valuesLen = `in`.readInt()
-                            `in`.skipBytes(valuesLen * 4)
-                            // Update framebuffer size if changed
-                            if (width > 0 && height > 0) {
-                                fbWidth = width
-                                fbHeight = height
-                                listener.onConnected(width, height)
-                            }
-                        }
-
-                        // KeyPress event
-                        2 -> {
-                            val replyLength = `in`.readInt()
-                            val detail = `in`.readInt() // keycode
-                            val time = `in`.readInt()
-                            val root = `in`.readInt()
-                            val window = `in`.readInt()
-                            val xRoot = `in`.readInt()
-                            val yRoot = `in`.readInt()
-                            val state = `in`.readInt()
-                            // Process key press
-                            // TODO: Convert X11 keycode to Android keycode
-                            val androidKeyCode = x11KeycodeToAndroid(detail)
-                            // Forward to UI thread for processing
-                        }
-
-                        // KeyRelease event
-                        3 -> {
-                            val replyLength = `in`.readInt()
-                            val detail = `in`.readInt()
-                            val time = `in`.readInt()
-                            val root = `in`.readInt()
-                            val window = `in`.readInt()
-                            val xRoot = `in`.readInt()
-                            val yRoot = `in`.readInt()
-                            val state = `in`.readInt()
-                            val androidKeyCode = x11KeycodeToAndroid(detail)
-                        }
-
-                        // ButtonPress event
-                        4 -> {
-                            val replyLength = `in`.readInt()
-                            val detail = `in`.readInt() // button
-                            val time = `in`.readInt()
-                            val root = `in`.readInt()
-                            val window = `in`.readInt()
-                            val xRoot = `in`.readInt()
-                            val yRoot = `in`.readInt()
-                            val state = `in`.readInt()
-                            // Process touch/click
-                        }
-
-                        // MotionNotify event
-                        6 -> {
-                            val replyLength = `in`.readInt()
-                            val detail = `in`.readInt() // same screen?
-                            val time = `in`.readInt()
-                            val root = `in`.readInt()
-                            val window = `in`.readInt()
-                            val xRoot = `in`.readInt()
-                            val yRoot = `in`.readInt()
-                            val x = `in`.readInt()
-                            val y = `in`.readInt()
-                            val state = `in`.readInt()
-                            // Process mouse motion
-                        }
-
-                        // PutImage request from server (for framebuffer updates)
-                        32 -> {
-                            // This is a client request, so we don't receive it
-                            // Server would send PutImage requests to us
-                        }
-
-                        // ShmPutImage request
-                        else -> {
-                            // Try to parse as generic event/packet
-                            val replyLength = `in`.readInt()
-                            `in`.skipBytes((replyLength - 1) * 4)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (running) {
-                    Log.e(TAG, "X11 receive loop error", e)
-                }
-            }
-        }.start()
+        if (screenWidth <= 0 || screenHeight <= 0) {
+            throw IOException("X server reported an empty screen (${screenWidth}x$screenHeight)")
+        }
+        listener.onConnected(screenWidth, screenHeight)
     }
 
     /**
-     * Send pointer event (mouse/touch) to X11 server.
-     * @param x X coordinate in framebuffer pixels
-     * @param y Y coordinate in framebuffer pixels
-     * @param mask Button mask (1 = button down, 0 = button up)
+     * Parses the setup reply body:
+     *
+     *   4 release, 4 resource-id-base, 4 resource-id-mask, 4 motion-buffer,
+     *   2 vendor length, 2 max request length, 1 #screens, 1 #formats,
+     *   1 image byte order, 1 bit order, 1 scanline unit, 1 scanline pad,
+     *   1 min keycode, 1 max keycode, 4 unused, vendor, formats, screens.
      */
-    fun sendPointerEvent(x: Int, y: Int, mask: Int) {
-        if (!running) return
-        try {
-            val `in` = input!!
-            val out = output!!
+    private fun parseSetup(b: ByteArray) {
+        var p = 0
 
-            // MotionNotify event
-            out.writeInt(6) // Major request: MotionNotify
-            out.writeInt(0) // Minor opcode: MotionNotify
-            out.writeInt(7) // length
-            out.writeInt(mask) // same screen flag (1 = same screen)
-            out.writeInt(windowId) // window id
-            out.writeInt(0) // root window
-            out.writeInt(0) // child window
-            out.writeInt(x) // x root
-            out.writeInt(y) // y root
-            out.writeInt(x) // x
-            out.writeInt(y) // y
-            out.writeInt(0) // state
-            out.flush()
+        fun u8(): Int = b[p++].toInt() and 0xFF
+        fun u16(): Int {
+            val v = ((b[p].toInt() and 0xFF) shl 8) or (b[p + 1].toInt() and 0xFF)
+            p += 2
+            return v
+        }
+        fun u32(): Int {
+            val v = ((b[p].toInt() and 0xFF) shl 24) or ((b[p + 1].toInt() and 0xFF) shl 16) or
+                    ((b[p + 2].toInt() and 0xFF) shl 8) or (b[p + 3].toInt() and 0xFF)
+            p += 4
+            return v
+        }
 
-            // ButtonPress/ButtonRelease event
-            if (mask == 1) {
-                out.writeInt(4) // Major request: ButtonPress
-                out.writeInt(1) // Minor opcode: ButtonPress
-                out.writeInt(7) // length
-                out.writeInt(1) // button (1 = left button)
-                out.writeInt(windowId) // window id
-                out.writeInt(0) // root window
-                out.writeInt(0) // child window
-                out.writeInt(x) // x root
-                out.writeInt(y) // y root
-                out.writeInt(x) // x
-                out.writeInt(y) // y
-                out.writeInt(0) // state
-                out.flush()
-            } else if (mask == 0) {
-                out.writeInt(5) // Major request: ButtonRelease
-                out.writeInt(1) // Minor opcode: ButtonRelease
-                out.writeInt(7) // length
-                out.writeInt(1) // button (1 = left button)
-                out.writeInt(windowId) // window id
-                out.writeInt(0) // root window
-                out.writeInt(0) // child window
-                out.writeInt(x) // x root
-                out.writeInt(y) // y root
-                out.writeInt(x) // x
-                out.writeInt(y) // y
-                out.writeInt(0) // state
-                out.flush()
+        u32()                       // release number
+        u32()                       // resource id base
+        u32()                       // resource id mask
+        u32()                       // motion buffer size
+        val vendorLen = u16()
+        u16()                       // maximum request length
+        val screenCount = u8()
+        val formatCount = u8()
+        imageLsbFirst = u8() == 1   // 0 = MSBFirst, 1 = LSBFirst
+        u8()                        // bitmap format bit order
+        u8()                        // bitmap format scanline unit
+        u8()                        // bitmap format scanline pad
+        u8()                        // min keycode
+        u8()                        // max keycode
+        p += 4                      // unused
+        p += vendorLen + pad4(vendorLen)
+
+        // Pixmap formats: 1 depth, 1 bits-per-pixel, 2 scanline-pad, 4 unused.
+        val bppByDepth = HashMap<Int, Int>(formatCount)
+        for (i in 0 until formatCount) {
+            val depth = u8()
+            val bpp = u8()
+            u16()                   // scanline pad
+            p += 4
+            bppByDepth[depth] = bpp
+        }
+
+        if (screenCount <= 0) throw IOException("X server has no screens")
+
+        // Screen 0: root, colormap, white, black, input masks, w, h, ...
+        rootWindow = u32()
+        u32()                       // default colormap
+        u32()                       // white pixel
+        u32()                       // black pixel
+        u32()                       // current input masks
+        screenWidth = u16()
+        screenHeight = u16()
+        u16()                       // width in mm
+        u16()                       // height in mm
+        u16()                       // min maps
+        u16()                       // max maps
+        u32()                       // root visual
+        u8()                        // backing store
+        u8()                        // save unders
+        val rootDepth = u8()
+        u8()                        // number of allowed depths
+
+        bitsPerPixel = bppByDepth[rootDepth] ?: 32
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Framebuffer polling                                                */
+    /* ------------------------------------------------------------------ */
+
+    private fun frameLoop(listener: Listener) {
+        val w = screenWidth
+        val h = screenHeight
+        val bytesPerPixel = bitsPerPixel / 8
+        val rowBytes = w * bytesPerPixel
+
+        val raw = ByteArray(rowBytes * h)
+        val previous = ByteArray(raw.size)
+        var havePrevious = false
+
+        frameA = IntArray(w * h)
+        frameB = IntArray(w * h)
+
+        while (running.get()) {
+            val started = System.currentTimeMillis()
+
+            val bytes = getImage(raw, w, h)
+            if (bytes > 0) {
+                var changed = !havePrevious
+                if (!changed) {
+                    // Cheap dirty check: no repaint unless something moved.
+                    var i = 0
+                    while (i < bytes) {
+                        if (raw[i] != previous[i]) { changed = true; break }
+                        i++
+                    }
+                }
+                if (changed) {
+                    System.arraycopy(raw, 0, previous, 0, bytes)
+                    havePrevious = true
+                    publishFrame(raw, w, h, listener)
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to send pointer event", e)
+
+            val elapsed = System.currentTimeMillis() - started
+            val sleep = FRAME_INTERVAL_MS - elapsed
+            if (sleep > 0) {
+                try {
+                    Thread.sleep(sleep)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
         }
     }
 
-    fun disconnect() {
-        running = false
-        try {
-            output?.let { it.writeInt(0); it.writeInt(0); it.flush() }
-        } catch (e: Exception) {
+    /**
+     * Sends a `GetImage` request for the whole root window and reads the reply
+     * into [raw]. Returns the number of image bytes, or 0 when the server
+     * answered with an error.
+     */
+    private fun getImage(raw: ByteArray, w: Int, h: Int): Int {
+        val out = output!!
+        val inp = input!!
+
+        synchronized(writeLock) {
+            out.writeByte(OP_GET_IMAGE)
+            out.writeByte(ZPIXMAP)
+            out.writeShort(5)              // 4 + 4 + 2*4 + 4 = 20 bytes
+            out.writeInt(rootWindow)
+            out.writeShort(0)              // x
+            out.writeShort(0)              // y
+            out.writeShort(w)
+            out.writeShort(h)
+            out.writeInt(0x00FFFFFF)       // plane mask
+            out.flush()
         }
-        socket?.close()
+
+        // Reply header (32 bytes) - a failed request also produces 32 bytes,
+        // so the stream stays aligned either way.
+        val type = inp.readUnsignedByte()
+        inp.readUnsignedByte()             // depth
+        inp.readUnsignedShort()            // sequence
+        val length = inp.readInt()         // image data, in 4-byte units
+        inp.readInt()                      // visual id
+        inp.skipBytes(20)
+
+        if (type == X_ERROR) {
+            Log.w(TAG, "GetImage rejected by the server (depth/pixmap mismatch?)")
+            return 0
+        }
+        if (type != X_REPLY) {
+            throw IOException("GetImage: unexpected reply type $type")
+        }
+
+        val bytes = length * 4
+        if (bytes <= 0 || bytes > raw.size) {
+            throw IOException("GetImage: implausible image size $bytes (buffer ${raw.size})")
+        }
+        inp.readFully(raw, 0, bytes)
+        return bytes
+    }
+
+    /** Converts the raw ZPixmap bytes into Android ARGB and hands them over. */
+    private fun publishFrame(raw: ByteArray, w: Int, h: Int, listener: Listener) {
+        val buffer = if (publishA) frameA!! else frameB!!
+        publishA = !publishA
+
+        when (bitsPerPixel) {
+            32 -> {
+                var i = 0
+                var o = 0
+                val n = w * h
+                while (o < n) {
+                    val b0 = raw[i].toInt() and 0xFF
+                    val b1 = raw[i + 1].toInt() and 0xFF
+                    val b2 = raw[i + 2].toInt() and 0xFF
+                    i += 4
+                    val r: Int
+                    val g: Int
+                    val b: Int
+                    if (imageLsbFirst) {
+                        b = b0; g = b1; r = b2
+                    } else {
+                        r = b0; g = b1; b = b2
+                    }
+                    buffer[o++] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
+                }
+            }
+            16 -> {
+                // RGB565 -> ARGB8888
+                var i = 0
+                var o = 0
+                val n = w * h
+                while (o < n) {
+                    val lo = raw[i].toInt() and 0xFF
+                    val hi = raw[i + 1].toInt() and 0xFF
+                    i += 2
+                    val v = if (imageLsbFirst) (hi shl 8) or lo else (lo shl 8) or hi
+                    val r = ((v shr 11) and 0x1F) * 255 / 31
+                    val g = ((v shr 5) and 0x3F) * 255 / 63
+                    val b = (v and 0x1F) * 255 / 31
+                    buffer[o++] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
+                }
+            }
+            else -> throw IOException("Unsupported bits-per-pixel $bitsPerPixel")
+        }
+
+        listener.onFramebuffer(w, h, buffer)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Input (XTEST FakeInput)                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Moves the pointer and, when [pressed] is not null, also presses or
+     * releases [button].
+     */
+    fun sendPointer(x: Int, y: Int, button: Int, pressed: Boolean?) {
+        inject(EV_MOTION, 0, x, y)
+        if (pressed != null) {
+            inject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, x, y)
+        }
+    }
+
+    fun sendKey(keycode: Int, pressed: Boolean) {
+        inject(if (pressed) EV_KEY_PRESS else EV_KEY_RELEASE, keycode, 0, 0)
+    }
+
+    /**
+     * XTEST `FakeInput`: 4 byte request header followed by a complete 32 byte
+     * `xEvent`:
+     *
+     *   type(1) detail(1) sequence(2) time(4) root(4) event(4) child(4)
+     *   rootX(2) rootY(2) eventX(2) eventY(2) state(2) sameScreen(1) pad(1)
+     */
+    private fun inject(eventType: Int, detail: Int, x: Int, y: Int) {
+        if (!running.get()) return
+        val out = output ?: return
+        try {
+            synchronized(writeLock) {
+                out.writeByte(XTEST_OPCODE)
+                out.writeByte(XTEST_FAKE_INPUT)
+                out.writeShort(9)          // 4 header + 32 event bytes
+                out.writeByte(eventType)
+                out.writeByte(detail)
+                out.writeShort(0)          // sequence
+                out.writeInt(0)            // time = CurrentTime
+                out.writeInt(rootWindow)   // root
+                out.writeInt(0)            // event window
+                out.writeInt(0)            // child window
+                out.writeShort(x)          // root-x
+                out.writeShort(y)          // root-y
+                out.writeShort(x)          // event-x
+                out.writeShort(y)          // event-y
+                out.writeShort(0)          // state (no modifiers)
+                out.writeByte(0)           // same-screen
+                out.writeByte(0)           // pad
+                out.flush()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to inject X input", t)
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+
+    /** Stops the loops and closes the socket. Safe to call more than once. */
+    fun disconnect() {
+        running.set(false)
+        closeQuietly()
+    }
+
+    private fun closeQuietly() {
+        try {
+            socket?.close()
+        } catch (_: Throwable) {
+            // ignored
+        }
         socket = null
         input = null
         output = null
     }
 
-    // Helper function to convert X11 keycodes to Android keycodes
-    private fun x11KeycodeToAndroid(x11Keycode: Int): Int {
-        // TODO: Implement proper mapping
-        // Common X11 keycodes to Android keycodes mapping
-        return when (x11Keycode) {
-            38 -> 19 // Up arrow
-            40 -> 20 // Down arrow
-            37 -> 21 // Left arrow
-            39 -> 22 // Right arrow
-            65 -> 4 // Space
-            65 -> 7 // Enter
-            else -> -1 // Unknown
-        }
-    }
+    private companion object {
+        const val TAG = "X11Client"
 
-    companion object {
-        private const val TAG = "X11Client"
+        const val SUCCESS = 1
+        const val FAILED = 0
+
+        const val X_REPLY = 1
+        const val X_ERROR = 0
+
+        const val OP_GET_IMAGE = 73
+        const val ZPIXMAP = 2
+
+        const val XTEST_OPCODE = 132
+        const val XTEST_FAKE_INPUT = 2
+
+        const val EV_KEY_PRESS = 2
+        const val EV_KEY_RELEASE = 3
+        const val EV_BUTTON_PRESS = 4
+        const val EV_BUTTON_RELEASE = 5
+        const val EV_MOTION = 6
+
+        const val CONNECT_TIMEOUT_MS = 5000
+        const val READ_TIMEOUT_MS = 15000
+
+        /** ~15 fps. GetImage over loopback is cheap but not free. */
+        const val FRAME_INTERVAL_MS = 66L
+
+        fun pad4(n: Int): Int = (4 - (n and 3)) and 3
+
+        fun hex(v: Int): String = "0x%x".format(v)
     }
 }
