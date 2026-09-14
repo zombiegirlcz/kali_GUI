@@ -163,6 +163,7 @@ class LauncherActivity : Activity() {
         // Reset cursor to the middle of the screen when entering mouse mode.
         cursorX = renderer.framebufferWidth / 2
         cursorY = renderer.framebufferHeight / 2
+        renderer.updatePointer(cursorX, cursorY)
         status.visibility = View.VISIBLE
         status.text = if (mouseMode) "Mouse mode: drag = move, tap = click, hold = right-click"
                        else "Touch mode: pointer follows finger"
@@ -220,15 +221,12 @@ class LauncherActivity : Activity() {
                     status.visibility = View.GONE
                     cursorX = width / 2
                     cursorY = height / 2
+                    renderer.updatePointer(cursorX, cursorY)
                     glView.requestRender()
                 }
 
                 override fun onFramebuffer(width: Int, height: Int, pixels: IntArray) {
                     renderer.updateFramebuffer(width, height, pixels)
-                }
-
-                override fun onCursor(cursor: X11Client.Cursor) {
-                    renderer.updateCursor(cursor)
                 }
 
                 override fun onDisconnected() = runOnUiThread {
@@ -287,6 +285,7 @@ class LauncherActivity : Activity() {
     /** TOUCH mode: the X pointer follows the finger; down = press, up = release. */
     private fun onDirectTouch(c: X11Client, event: MotionEvent): Boolean {
         val (x, y) = toFramebuffer(event.x, event.y) ?: return true
+        renderer.updatePointer(x, y)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> c.sendPointer(x, y, BUTTON_LEFT, true)
             MotionEvent.ACTION_MOVE -> c.sendPointer(x, y, BUTTON_LEFT, null)
@@ -323,12 +322,14 @@ class LauncherActivity : Activity() {
                     moved = true
                     downX = event.x
                     downY = event.y
+                    renderer.updatePointer(cursorX, cursorY)
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
                 }
             }
             MotionEvent.ACTION_UP -> {
                 val held = System.currentTimeMillis() - downTime
                 val button = if (held >= LONG_PRESS_MS && !moved) BUTTON_RIGHT else BUTTON_LEFT
+                renderer.updatePointer(cursorX, cursorY)
                 // Always move first, then click in place.
                 c.sendPointer(cursorX, cursorY, button, true)
                 c.sendPointer(cursorX, cursorY, button, false)

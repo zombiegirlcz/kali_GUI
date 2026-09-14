@@ -46,15 +46,22 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
     private var surfaceWidth = 0
     private var surfaceHeight = 0
 
-    /** Cursor overlay state (XFixes sprite, drawn on top of the framebuffer). */
+    /**
+     * Pointer overlay. The cursor is NOT part of the X11 framebuffer (GetImage
+     * never returns it), so we draw our own arrow sprite at the position the
+     * input layer reports.
+     */
     private var cursorTexture = 0
     private var cursorBuffer: FloatBuffer? = null
-    private var cursorUpload: java.nio.IntBuffer? = null
-    private var cursorWidth = 0
-    private var cursorHeight = 0
 
     @Volatile
-    private var pendingCursor: X11Client.Cursor? = null
+    private var pendingPointerX = 0
+
+    @Volatile
+    private var pendingPointerY = 0
+
+    @Volatile
+    private var pointerVisible = false
 
     /** Size of the remote framebuffer, used for touch coordinate mapping. */
     @Volatile
@@ -92,9 +99,11 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         glView.requestRender()
     }
 
-    /** Called from the network thread whenever the cursor sprite/position changed. */
-    fun updateCursor(cursor: X11Client.Cursor) {
-        pendingCursor = cursor
+    /** Called whenever the pointer moved (or just became visible). */
+    fun updatePointer(x: Int, y: Int) {
+        pendingPointerX = x
+        pendingPointerY = y
+        pointerVisible = true
         glView.requestRender()
     }
 
@@ -113,7 +122,7 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        // Separate texture for the cursor sprite; NEAREST keeps it crisp.
+        // Pointer arrow texture, generated once from a small ARGB bitmap.
         GLES20.glGenTextures(1, ids, 0)
         cursorTexture = ids[0]
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
@@ -121,6 +130,7 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        uploadArrowTexture()
 
         // Full-screen triangle strip: x, y, u, v. The V coordinate is inverted
         // because X11 images start at the top row while GL textures start at
@@ -230,45 +240,40 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glDisableVertexAttribArray(texCoordHandle)
     }
 
+    /** Uploads the built-in arrow sprite (ARROW is ARGB, premultiplied). */
+    private fun uploadArrowTexture() {
+        val buf = ByteBuffer.allocateDirect(ARROW.size * 4)
+                .order(ByteOrder.nativeOrder())
+                .asIntBuffer()
+        buf.put(ARROW)
+        buf.position(0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
+        GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                ARROW_W, ARROW_H, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+    }
+
     /**
-     * Draws the XFixes cursor sprite at the pointer position. The server never
-     * includes the cursor in GetImage output, so without this the pointer is
-     * invisible even though it moves.
+     * Draws the pointer arrow at the last reported position. Without this the
+     * pointer is invisible: X11 GetImage on the root window never includes the
+     * cursor (it is a hardware/compositing overlay).
      */
     private fun drawCursor() {
-        val c = pendingCursor ?: return
-        if (cursorTexture == 0 || c.width <= 0 || c.height <= 0) return
+        if (!pointerVisible || cursorTexture == 0) return
 
         val fbW = framebufferWidth
         val fbH = framebufferHeight
         if (fbW <= 0 || fbH <= 0) return
 
-        if (cursorUpload == null || cursorWidth != c.width || cursorHeight != c.height) {
-            cursorUpload = ByteBuffer.allocateDirect(c.pixels.size * 4)
-                    .order(ByteOrder.nativeOrder())
-                    .asIntBuffer()
-            cursorWidth = c.width
-            cursorHeight = c.height
-        }
-        val up = cursorUpload!!
-        up.clear()
-        up.put(c.pixels)
-        up.position(0)
-
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
-        GLES20.glTexImage2D(
-                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-                c.width, c.height, 0,
-                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, up)
-
-        // Top-left of the sprite in framebuffer pixels (pointer minus hot spot).
-        val left = (c.x - c.xhot).toFloat()
-        val top = (c.y - c.yhot).toFloat()
+        // Arrow hot spot is its top-left corner (0,0) in ARROW.
+        val left = pendingPointerX.toFloat()
+        val top = pendingPointerY.toFloat()
 
         val x0 = 2f * left / fbW - 1f
-        val x1 = 2f * (left + c.width) / fbW - 1f
+        val x1 = 2f * (left + ARROW_W) / fbW - 1f
         val y0 = 1f - 2f * top / fbH          // top edge -> larger NDC y
-        val y1 = 1f - 2f * (top + c.height) / fbH
+        val y1 = 1f - 2f * (top + ARROW_H) / fbH
 
         val quad = floatArrayOf(
                 x0, y1, 0f, 1f,
@@ -287,7 +292,7 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         buf.put(quad)
         buf.position(0)
 
-        // Premultiplied ARGB from XFixes -> standard premultiplied blending.
+        // Premultiplied ARGB sprite -> standard premultiplied blending.
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
@@ -345,6 +350,33 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
 
     private companion object {
         const val TAG = "X11Renderer"
+
+        const val ARROW_W = 16
+        const val ARROW_H = 16
+
+        /**
+         * Classic white arrow with a black outline and a soft drop shadow,
+         * premultiplied ARGB. Generated at build time by hand so the viewer
+         * does not depend on the server for a cursor image.
+         */
+        val ARROW = intArrayOf(
+            0xF0000000.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0xF0000000.toInt(), 0xF0000000.toInt(), 0xF0000000.toInt(), 0xF0000000.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0xF0000000.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xF0000000.toInt(), 0xFFFFFFFF.toInt(), 0xFFFFFFFF.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+            0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xF0000000.toInt(), 0xF0000000.toInt(), 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        )
 
         const val VERTEX_SHADER = """
             attribute vec4 aPosition;
