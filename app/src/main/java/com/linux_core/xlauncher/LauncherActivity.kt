@@ -61,7 +61,22 @@ class LauncherActivity : Activity() {
     private var downX = 0f
     private var downY = 0f
     private var downTime = 0L
-    private var moved = false
+
+    /**
+     * True once the finger travelled further than [tapSlopPx] during the
+     * gesture. A click is only delivered when this stays false, so releasing
+     * after dragging the pointer does NOT fire a click.
+     */
+    private var dragged = false
+
+    /** Anchor of the gesture start, used only for cumulative slop detection. */
+    private var slopAnchorX = 0f
+    private var slopAnchorY = 0f
+
+    /** Touch slop in pixels (~12dp); below this a gesture still counts as a tap. */
+    private val tapSlopPx: Float by lazy {
+        (12f * resources.displayMetrics.density)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -302,40 +317,54 @@ class LauncherActivity : Activity() {
     private fun onMouseTouch(c: X11Client, event: MotionEvent): Boolean {
         if (renderer.viewportWidth <= 0 || renderer.framebufferWidth <= 0) return true
 
-        // Sensitivity: full viewport width maps to the whole screen.
-        val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
-        val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
                 downY = event.y
+                slopAnchorX = event.x
+                slopAnchorY = event.y
                 downTime = System.currentTimeMillis()
-                moved = false
+                dragged = false
             }
             MotionEvent.ACTION_MOVE -> {
+                // Cumulative travel since the gesture started decides tap vs drag.
+                val slopX = event.x - slopAnchorX
+                val slopY = event.y - slopAnchorY
+                if (!dragged && (slopX * slopX + slopY * slopY) > tapSlopPx * tapSlopPx) {
+                    dragged = true
+                }
+                // Per-move delta drives the pointer motion.
+                val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
+                val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
                 val nx = (cursorX + dx).toInt().coerceIn(0, renderer.framebufferWidth - 1)
                 val ny = (cursorY + dy).toInt().coerceIn(0, renderer.framebufferHeight - 1)
                 if (nx != cursorX || ny != cursorY) {
                     cursorX = nx
                     cursorY = ny
-                    moved = true
-                    downX = event.x
-                    downY = event.y
                     renderer.updatePointer(cursorX, cursorY)
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
                 }
+                // Re-anchor so the next MOVE only applies the new delta.
+                downX = event.x
+                downY = event.y
             }
             MotionEvent.ACTION_UP -> {
-                val held = System.currentTimeMillis() - downTime
-                val button = if (held >= LONG_PRESS_MS && !moved) BUTTON_RIGHT else BUTTON_LEFT
-                renderer.updatePointer(cursorX, cursorY)
-                // Always move first, then click in place.
-                c.sendPointer(cursorX, cursorY, button, true)
-                c.sendPointer(cursorX, cursorY, button, false)
+                // A drag must never click: only a tap (pointer never travelled
+                // past the slop) generates a button press/release.
+                if (!dragged) {
+                    val held = System.currentTimeMillis() - downTime
+                    val button = if (held >= LONG_PRESS_MS) BUTTON_RIGHT else BUTTON_LEFT
+                    renderer.updatePointer(cursorX, cursorY)
+                    // Move first, then click in place.
+                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
+                    c.sendPointer(cursorX, cursorY, button, true)
+                    c.sendPointer(cursorX, cursorY, button, false)
+                }
+                dragged = false
             }
             MotionEvent.ACTION_CANCEL -> {
                 // Nothing pressed; just leave the cursor where it is.
+                dragged = false
             }
         }
         return true
