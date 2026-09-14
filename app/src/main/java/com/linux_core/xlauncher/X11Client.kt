@@ -290,6 +290,19 @@ class X11Client {
     }
 
     /**
+     * Reads the first byte of the next packet, skipping any 32-byte events that
+     * arrive interleaved with replies. Returns [X_REPLY] (1) or [X_ERROR] (0).
+     */
+    private fun readReplyType(inp: DataInputStream): Int {
+        while (true) {
+            val type = inp.readUnsignedByte()
+            if (type == X_REPLY || type == X_ERROR) return type
+            // Any other value is an event: skip the remaining 31 bytes.
+            inp.skipBytes(31)
+        }
+    }
+
+    /**
      * Sends a `GetImage` request for the whole root window and reads the reply
      * into [raw]. Returns the number of image bytes, or 0 when the server
      * answered with an error.
@@ -311,9 +324,17 @@ class X11Client {
             out.flush()
         }
 
+        // Events are interleaved with replies on the same stream: every X11
+        // event (e.g. MappingNotify when XFCE changes the keymap, or Expose)
+        // is a full 32-byte packet. We did not select any event mask, but the
+        // server still delivers MappingNotify to every client — so we must
+        // drain events until the actual reply (1) or error (0) arrives.
+        // (This was the real "unexpected reply type 34" failure: type 34 is
+        // MappingNotify, not a malformed reply.)
+        val type = readReplyType(inp)
+
         // Reply header (32 bytes) - a failed request also produces 32 bytes,
         // so the stream stays aligned either way.
-        val type = inp.readUnsignedByte()
         inp.readUnsignedByte()             // depth
         inp.readUnsignedShort()            // sequence
         val length = inp.readInt()         // image data, in 4-byte units
