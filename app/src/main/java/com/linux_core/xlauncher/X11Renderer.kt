@@ -46,6 +46,16 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
     private var surfaceWidth = 0
     private var surfaceHeight = 0
 
+    /** Cursor overlay state (XFixes sprite, drawn on top of the framebuffer). */
+    private var cursorTexture = 0
+    private var cursorBuffer: FloatBuffer? = null
+    private var cursorUpload: java.nio.IntBuffer? = null
+    private var cursorWidth = 0
+    private var cursorHeight = 0
+
+    @Volatile
+    private var pendingCursor: X11Client.Cursor? = null
+
     /** Size of the remote framebuffer, used for touch coordinate mapping. */
     @Volatile
     var framebufferWidth = 0
@@ -82,6 +92,12 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         glView.requestRender()
     }
 
+    /** Called from the network thread whenever the cursor sprite/position changed. */
+    fun updateCursor(cursor: X11Client.Cursor) {
+        pendingCursor = cursor
+        glView.requestRender()
+    }
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
@@ -94,6 +110,15 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        // Separate texture for the cursor sprite; NEAREST keeps it crisp.
+        GLES20.glGenTextures(1, ids, 0)
+        cursorTexture = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
@@ -155,11 +180,13 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         applyViewport()
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        val pixels = pendingPixels ?: return
-        if (pendingWidth <= 0 || pendingHeight <= 0) return
-
-        uploadTexture(pendingWidth, pendingHeight, pixels)
-        drawQuad()
+        val pixels = pendingPixels
+        if (pixels != null && pendingWidth > 0 && pendingHeight > 0) {
+            uploadTexture(pendingWidth, pendingHeight, pixels)
+            drawQuad()
+        }
+        // Cursor is an overlay: GetImage never returns it, so we draw it here.
+        drawCursor()
     }
 
     private fun uploadTexture(width: Int, height: Int, pixels: IntArray) {
@@ -201,6 +228,84 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
 
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(texCoordHandle)
+    }
+
+    /**
+     * Draws the XFixes cursor sprite at the pointer position. The server never
+     * includes the cursor in GetImage output, so without this the pointer is
+     * invisible even though it moves.
+     */
+    private fun drawCursor() {
+        val c = pendingCursor ?: return
+        if (cursorTexture == 0 || c.width <= 0 || c.height <= 0) return
+
+        val fbW = framebufferWidth
+        val fbH = framebufferHeight
+        if (fbW <= 0 || fbH <= 0) return
+
+        if (cursorUpload == null || cursorWidth != c.width || cursorHeight != c.height) {
+            cursorUpload = ByteBuffer.allocateDirect(c.pixels.size * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .asIntBuffer()
+            cursorWidth = c.width
+            cursorHeight = c.height
+        }
+        val up = cursorUpload!!
+        up.clear()
+        up.put(c.pixels)
+        up.position(0)
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
+        GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                c.width, c.height, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, up)
+
+        // Top-left of the sprite in framebuffer pixels (pointer minus hot spot).
+        val left = (c.x - c.xhot).toFloat()
+        val top = (c.y - c.yhot).toFloat()
+
+        val x0 = 2f * left / fbW - 1f
+        val x1 = 2f * (left + c.width) / fbW - 1f
+        val y0 = 1f - 2f * top / fbH          // top edge -> larger NDC y
+        val y1 = 1f - 2f * (top + c.height) / fbH
+
+        val quad = floatArrayOf(
+                x0, y1, 0f, 1f,
+                x1, y1, 1f, 1f,
+                x0, y0, 0f, 0f,
+                x1, y0, 1f, 0f,
+        )
+        var buf = cursorBuffer
+        if (buf == null) {
+            buf = ByteBuffer.allocateDirect(quad.size * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .asFloatBuffer()
+            cursorBuffer = buf
+        }
+        buf.clear()
+        buf.put(quad)
+        buf.position(0)
+
+        // Premultiplied ARGB from XFixes -> standard premultiplied blending.
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+
+        GLES20.glUseProgram(program)
+        buf.position(0)
+        GLES20.glEnableVertexAttribArray(positionHandle)
+        GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 16, buf)
+        buf.position(2)
+        GLES20.glEnableVertexAttribArray(texCoordHandle)
+        GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 16, buf)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cursorTexture)
+        GLES20.glUniform1i(samplerHandle, 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(positionHandle)
+        GLES20.glDisableVertexAttribArray(texCoordHandle)
+
+        GLES20.glDisable(GLES20.GL_BLEND)
     }
 
     /* ------------------------------------------------------------------ */

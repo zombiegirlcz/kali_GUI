@@ -227,6 +227,10 @@ class LauncherActivity : Activity() {
                     renderer.updateFramebuffer(width, height, pixels)
                 }
 
+                override fun onCursor(cursor: X11Client.Cursor) {
+                    renderer.updateCursor(cursor)
+                }
+
                 override fun onDisconnected() = runOnUiThread {
                     if (!isFinishing && !hadError) {
                         status.visibility = View.VISIBLE

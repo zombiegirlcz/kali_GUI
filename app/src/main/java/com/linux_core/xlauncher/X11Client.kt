@@ -38,9 +38,25 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class X11Client {
 
+    /**
+     * Cursor sprite reported by the XFixes extension. [pixels] is ARGB
+     * (premultiplied) laid out row-major, [x]/[y] is the pointer position in
+     * root coordinates and [xhot]/[yhot] the sprite's hot spot.
+     */
+    class Cursor(
+        val x: Int,
+        val y: Int,
+        val xhot: Int,
+        val yhot: Int,
+        val width: Int,
+        val height: Int,
+        val pixels: IntArray,
+    )
+
     interface Listener {
         fun onConnected(width: Int, height: Int)
         fun onFramebuffer(width: Int, height: Int, pixels: IntArray)
+        fun onCursor(cursor: Cursor)
         fun onDisconnected()
         fun onError(t: Throwable)
     }
@@ -76,6 +92,9 @@ class X11Client {
     private var frameA: IntArray? = null
     private var frameB: IntArray? = null
     private var publishA = true
+
+    /** XFixes extension opcode (0 when unavailable) for cursor reporting. */
+    private var xfixesOpcode = 0
 
     /**
      * Connects, performs the setup handshake and then blocks in the framebuffer
@@ -161,6 +180,13 @@ class X11Client {
         if (screenWidth <= 0 || screenHeight <= 0) {
             throw IOException("X server reported an empty screen (${screenWidth}x$screenHeight)")
         }
+
+        // XFixes gives us the actual cursor sprite + pointer position, because
+        // GetImage on the root window does NOT include the cursor (it is a
+        // hardware/compositing overlay, not part of the framebuffer).
+        xfixesOpcode = queryExtension("XFIXES")
+        Log.i(TAG, "XFixes extension opcode=$xfixesOpcode")
+
         listener.onConnected(screenWidth, screenHeight)
     }
 
@@ -276,6 +302,10 @@ class X11Client {
                 }
             }
 
+            if (xfixesOpcode != 0) {
+                getCursor()?.let { listener.onCursor(it) }
+            }
+
             val elapsed = System.currentTimeMillis() - started
             val sleep = FRAME_INTERVAL_MS - elapsed
             if (sleep > 0) {
@@ -300,6 +330,81 @@ class X11Client {
             // Any other value is an event: skip the remaining 31 bytes.
             inp.skipBytes(31)
         }
+    }
+
+    /**
+     * Issues a QueryExtension request and returns the extension's major opcode
+     * (0 when the server does not know the extension).
+     */
+    private fun queryExtension(name: String): Int {
+        val out = output!!
+        val inp = input!!
+        val nameBytes = name.toByteArray(Charsets.US_ASCII)
+        val padded = nameBytes.size + pad4(nameBytes.size)
+
+        synchronized(writeLock) {
+            out.writeByte(OP_QUERY_EXTENSION)
+            out.writeByte(0)
+            out.writeShort(1 + padded / 4)   // 4 data bytes + padded name
+            out.writeShort(nameBytes.size)
+            out.writeShort(0)
+            out.write(nameBytes)
+            repeat(pad4(nameBytes.size)) { out.writeByte(0) }
+            out.flush()
+        }
+
+        val type = readReplyType(inp)
+        inp.readUnsignedByte()          // unused
+        inp.readUnsignedShort()         // sequence
+        inp.readInt()                   // reply length
+        val present = inp.readUnsignedByte()
+        val majorOpcode = inp.readUnsignedByte()
+        inp.readUnsignedByte()          // first event
+        inp.readUnsignedByte()          // first error
+        inp.skipBytes(20)
+
+        if (type != X_REPLY) return 0
+        return if (present != 0) majorOpcode else 0
+    }
+
+    /**
+     * Fetches the current cursor image + pointer position via XFixes. Returns
+     * null when the extension is unavailable or the server answered an error.
+     */
+    private fun getCursor(): Cursor? {
+        val out = output!!
+        val inp = input!!
+
+        synchronized(writeLock) {
+            out.writeByte(xfixesOpcode)
+            out.writeByte(XFIXES_GET_CURSOR_IMAGE)
+            out.writeShort(2)          // 4 data bytes (cursor = None)
+            out.writeInt(0)            // None -> currently displayed cursor
+            out.flush()
+        }
+
+        val type = readReplyType(inp)
+        inp.readUnsignedByte()          // unused
+        inp.readUnsignedShort()         // sequence
+        inp.readInt()                   // reply length
+        val x = inp.readUnsignedShort()
+        val y = inp.readUnsignedShort()
+        val w = inp.readUnsignedShort()
+        val h = inp.readUnsignedShort()
+        val xhot = inp.readUnsignedShort()
+        val yhot = inp.readUnsignedShort()
+        inp.readInt()                   // cursor serial
+        inp.skipBytes(8)
+
+        if (type == X_ERROR) {
+            Log.w(TAG, "XFixesGetCursorImage returned an error")
+            return null
+        }
+        if (w <= 0 || h <= 0 || w > 512 || h > 512) return null
+
+        val pixels = IntArray(w * h)
+        for (i in pixels.indices) pixels[i] = inp.readInt()
+        return Cursor(x, y, xhot, yhot, w, h, pixels)
     }
 
     /**
@@ -489,7 +594,10 @@ class X11Client {
         const val X_ERROR = 0
 
         const val OP_GET_IMAGE = 73
+        const val OP_QUERY_EXTENSION = 98
         const val ZPIXMAP = 2
+
+        const val XFIXES_GET_CURSOR_IMAGE = 4
 
         const val XTEST_OPCODE = 132
         const val XTEST_FAKE_INPUT = 2
