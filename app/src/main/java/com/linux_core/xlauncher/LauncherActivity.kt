@@ -21,7 +21,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.net.ConnectException
+import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
+import java.net.URL
 
 /**
  * Standalone X11 desktop viewer.
@@ -151,10 +153,12 @@ class LauncherActivity : Activity() {
         val kb = controlButton("⌨") { toggleKeyboard() }
         modeButton = controlButton(modeLabel()) { toggleMode() }
         val esc = controlButton("Esc") { sendEscape() }
+        val term = controlButton("⌘") { openTerminal() }
 
         bar.addView(kb)
         bar.addView(modeButton)
         bar.addView(esc)
+        bar.addView(term)
         return bar
     }
 
@@ -202,6 +206,40 @@ class LauncherActivity : Activity() {
     private fun sendEscape() {
         client?.sendKey(X_KEY_ESCAPE, true)
         client?.sendKey(X_KEY_ESCAPE, false)
+    }
+
+    /**
+     * Switches back to the core app terminal.
+     *
+     * TerminalActivity is deliberately `exported="false"`, so an external app
+     * cannot start it. We ask the already running core app over its localhost
+     * REST bridge instead (loopback requests need no Bearer token).
+     */
+    private fun openTerminal() {
+        Thread({
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(CORE_TERMINAL_URL).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 3000
+                    readTimeout = 3000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                }
+                conn.outputStream.use { it.write("{}".toByteArray()) }
+                val code = conn.responseCode
+                Log.i(TAG, "openTerminal -> HTTP $code")
+                if (code !in 200..299) throw java.io.IOException("HTTP $code")
+            } catch (t: Throwable) {
+                Log.e(TAG, "openTerminal failed", t)
+                runOnUiThread {
+                    status.visibility = View.VISIBLE
+                    status.text = "Nelze otevřít terminál (běží aplikace com.linux_core?)\n${t.message ?: t.javaClass.simpleName}"
+                }
+            } finally {
+                conn?.disconnect()
+            }
+        }, "open-terminal").start()
     }
 
     /**
@@ -383,6 +421,9 @@ class LauncherActivity : Activity() {
         const val LONG_PRESS_MS = 400L
 
         const val X_KEY_ESCAPE = 9
+
+        /** Localhost REST bridge of the core app (Loopback: no Bearer token). */
+        const val CORE_TERMINAL_URL = "http://127.0.0.1:1337/terminal/open"
 
         /**
          * X keycodes for a US layout, indexed by `letter - 'a'`. The X physical
