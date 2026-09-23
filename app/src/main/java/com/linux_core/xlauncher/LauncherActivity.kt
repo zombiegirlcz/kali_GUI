@@ -80,6 +80,23 @@ class LauncherActivity : Activity() {
         (12f * resources.displayMetrics.density)
     }
 
+    /** Pending long-press timer: hold still to grab (press & hold the button). */
+    private var longPressRunnable: Runnable? = null
+
+    /** True while a long-press grab is active, i.e. the left button is held. */
+    private var grabbing = false
+
+    /** Two-finger scroll bookkeeping (shared by both modes). */
+    private var scrolling = false
+    private var scrollLastY = 0f
+    private var scrollAccum = 0f
+
+    /** True while the soft keyboard is showing, so toggling stays reliable. */
+    private var keyboardVisible = false
+
+    /** True while TOUCH mode holds the left button down (finger on screen). */
+    private var directPressed = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -193,13 +210,22 @@ class LauncherActivity : Activity() {
 
     private fun toggleKeyboard() {
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        if (imeProxy.hasFocus()) {
+        // Track visibility explicitly: after hiding, imeProxy keeps focus (the
+        // GLSurfaceView is not focusable), so hasFocus() would report true the
+        // next time and we would hide again instead of showing. That was the
+        // "keyboard only pops up once" bug.
+        if (keyboardVisible) {
             imm.hideSoftInputFromWindow(imeProxy.windowToken, 0)
+            imeProxy.clearFocus()
             glView.requestFocus()
+            keyboardVisible = false
         } else {
             imeProxy.requestFocus()
             imeProxy.text.clear()
-            imm.showSoftInput(imeProxy, InputMethodManager.SHOW_IMPLICIT)
+            imeProxy.post {
+                imm.showSoftInput(imeProxy, InputMethodManager.SHOW_FORCED)
+            }
+            keyboardVisible = true
         }
     }
 
@@ -332,7 +358,79 @@ class LauncherActivity : Activity() {
 
     private fun onDesktopTouch(event: MotionEvent): Boolean {
         val c = client ?: return true
+        // Two-finger drag scrolls, in both modes.
+        if (event.pointerCount >= 2) {
+            cancelLongPress()
+            releaseGrab(c)
+            // A second finger turns a TOUCH-mode press into a scroll: drop the
+            // button we had already pressed, otherwise X keeps it held down.
+            if (directPressed) {
+                c.sendButton(BUTTON_LEFT, false)
+                directPressed = false
+            }
+            return onScrollTouch(c, event)
+        }
+        // Ignore the tail of a scroll gesture once the second finger lifted.
+        if (scrolling) {
+            if (event.actionMasked == MotionEvent.ACTION_UP ||
+                    event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                scrolling = false
+                scrollAccum = 0f
+            }
+            return true
+        }
         return if (mouseMode) onMouseTouch(c, event) else onDirectTouch(c, event)
+    }
+
+    /**
+     * TWO-FINGER SCROLL: the average Y of both fingers drives mouse-wheel
+     * button 4 (up) / 5 (down). Dragging the fingers down scrolls the view up,
+     * like a touchscreen.
+     */
+    private fun onScrollTouch(c: X11Client, event: MotionEvent): Boolean {
+        val y = (event.getY(0) + event.getY(1)) / 2f
+        when (event.actionMasked) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                scrolling = true
+                scrollAccum = 0f
+                scrollLastY = y
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!scrolling) {
+                    scrolling = true
+                    scrollLastY = y
+                    return true
+                }
+                val dy = y - scrollLastY
+                scrollLastY = y
+                scrollAccum += dy
+                val notch = 24f * resources.displayMetrics.density
+                // Finger up (dy < 0) => content scrolls down => wheel down (5).
+                while (scrollAccum <= -notch) {
+                    scrollAccum += notch
+                    wheel(c, up = false)
+                }
+                while (scrollAccum >= notch) {
+                    scrollAccum -= notch
+                    wheel(c, up = true)
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                scrolling = false
+                scrollAccum = 0f
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                scrolling = false
+                scrollAccum = 0f
+            }
+        }
+        return true
+    }
+
+    private fun wheel(c: X11Client, up: Boolean) {
+        val button = if (up) BUTTON_WHEEL_UP else BUTTON_WHEEL_DOWN
+        c.sendButton(button, true)
+        c.sendButton(button, false)
     }
 
     /** TOUCH mode: the X pointer follows the finger; down = press, up = release. */
@@ -340,9 +438,15 @@ class LauncherActivity : Activity() {
         val (x, y) = toFramebuffer(event.x, event.y) ?: return true
         renderer.updatePointer(x, y)
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> c.sendPointer(x, y, BUTTON_LEFT, true)
+            MotionEvent.ACTION_DOWN -> {
+                c.sendPointer(x, y, BUTTON_LEFT, true)
+                directPressed = true
+            }
             MotionEvent.ACTION_MOVE -> c.sendPointer(x, y, BUTTON_LEFT, null)
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> c.sendPointer(x, y, BUTTON_LEFT, false)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                c.sendPointer(x, y, BUTTON_LEFT, false)
+                directPressed = false
+            }
         }
         return true
     }
@@ -363,6 +467,10 @@ class LauncherActivity : Activity() {
                 slopAnchorY = event.y
                 downTime = System.currentTimeMillis()
                 dragged = false
+                grabbing = false
+                // Hold still to grab (press & hold) and drag with the button
+                // down; a quick tap still clicks.
+                scheduleLongPress(c)
             }
             MotionEvent.ACTION_MOVE -> {
                 // Cumulative travel since the gesture started decides tap vs drag.
@@ -370,42 +478,76 @@ class LauncherActivity : Activity() {
                 val slopY = event.y - slopAnchorY
                 if (!dragged && (slopX * slopX + slopY * slopY) > tapSlopPx * tapSlopPx) {
                     dragged = true
+                    cancelLongPress()
                 }
-                // Per-move delta drives the pointer motion.
-                val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
-                val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
-                val nx = (cursorX + dx).toInt().coerceIn(0, renderer.framebufferWidth - 1)
-                val ny = (cursorY + dy).toInt().coerceIn(0, renderer.framebufferHeight - 1)
-                if (nx != cursorX || ny != cursorY) {
-                    cursorX = nx
-                    cursorY = ny
-                    renderer.updatePointer(cursorX, cursorY)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                }
+                movePointer(c, event, pressed = grabbing)
                 // Re-anchor so the next MOVE only applies the new delta.
                 downX = event.x
                 downY = event.y
             }
             MotionEvent.ACTION_UP -> {
-                // A drag must never click: only a tap (pointer never travelled
-                // past the slop) generates a button press/release.
-                if (!dragged) {
-                    val held = System.currentTimeMillis() - downTime
-                    val button = if (held >= LONG_PRESS_MS) BUTTON_RIGHT else BUTTON_LEFT
+                cancelLongPress()
+                if (grabbing) {
+                    // End the grab: release the held button in place.
+                    c.sendButton(BUTTON_LEFT, false)
+                    grabbing = false
+                } else if (!dragged) {
+                    // A tap clicks the left button at the cursor. A drag must
+                    // never click, so only a slop-free gesture fires.
                     renderer.updatePointer(cursorX, cursorY)
-                    // Move first, then click in place.
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                    c.sendPointer(cursorX, cursorY, button, true)
-                    c.sendPointer(cursorX, cursorY, button, false)
+                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, true)
+                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, false)
                 }
                 dragged = false
             }
             MotionEvent.ACTION_CANCEL -> {
-                // Nothing pressed; just leave the cursor where it is.
+                cancelLongPress()
+                releaseGrab(c)
                 dragged = false
             }
         }
         return true
+    }
+
+    /** Applies one-finger motion to the cursor, optionally with the button held. */
+    private fun movePointer(c: X11Client, event: MotionEvent, pressed: Boolean) {
+        val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
+        val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
+        val nx = (cursorX + dx).toInt().coerceIn(0, renderer.framebufferWidth - 1)
+        val ny = (cursorY + dy).toInt().coerceIn(0, renderer.framebufferHeight - 1)
+        if (nx != cursorX || ny != cursorY) {
+            cursorX = nx
+            cursorY = ny
+            renderer.updatePointer(cursorX, cursorY)
+            // Pure motion. When [pressed] the button is already held from the
+            // long-press grab; X keeps it down across motion events.
+            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
+        }
+    }
+
+    private fun scheduleLongPress(c: X11Client) {
+        cancelLongPress()
+        val r = Runnable {
+            if (!dragged && !grabbing) {
+                grabbing = true
+                c.sendButton(BUTTON_LEFT, true)
+            }
+        }
+        longPressRunnable = r
+        Handler(Looper.getMainLooper()).postDelayed(r, LONG_PRESS_MS)
+    }
+
+    private fun cancelLongPress() {
+        longPressRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        longPressRunnable = null
+    }
+
+    private fun releaseGrab(c: X11Client) {
+        if (grabbing) {
+            c.sendButton(BUTTON_LEFT, false)
+            grabbing = false
+        }
     }
 
     override fun onDestroy() {
@@ -418,6 +560,8 @@ class LauncherActivity : Activity() {
         const val TAG = "LauncherActivity"
         const val BUTTON_LEFT = 1
         const val BUTTON_RIGHT = 3
+        const val BUTTON_WHEEL_UP = 4
+        const val BUTTON_WHEEL_DOWN = 5
         const val LONG_PRESS_MS = 400L
 
         const val X_KEY_ESCAPE = 9

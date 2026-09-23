@@ -425,6 +425,15 @@ class X11Client {
         }
     }
 
+    /**
+     * Presses/releases a button without moving the pointer. X uses the current
+     * pointer position for button events, so the wheel can be scrolled without
+     * jumping the cursor to a stale location.
+     */
+    fun sendButton(button: Int, pressed: Boolean) {
+        inject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, 0, 0)
+    }
+
     fun sendKey(keycode: Int, pressed: Boolean) {
         inject(if (pressed) EV_KEY_PRESS else EV_KEY_RELEASE, keycode, 0, 0)
     }
