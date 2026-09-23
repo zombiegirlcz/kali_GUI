@@ -480,7 +480,7 @@ class LauncherActivity : Activity() {
                     dragged = true
                     cancelLongPress()
                 }
-                movePointer(c, event, pressed = grabbing)
+                movePointer(c, event)
                 // Re-anchor so the next MOVE only applies the new delta.
                 downX = event.x
                 downY = event.y
@@ -510,8 +510,8 @@ class LauncherActivity : Activity() {
         return true
     }
 
-    /** Applies one-finger motion to the cursor, optionally with the button held. */
-    private fun movePointer(c: X11Client, event: MotionEvent, pressed: Boolean) {
+    /** Applies one-finger motion to the cursor (pure motion, no button change). */
+    private fun movePointer(c: X11Client, event: MotionEvent) {
         val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
         val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
         val nx = (cursorX + dx).toInt().coerceIn(0, renderer.framebufferWidth - 1)
@@ -520,8 +520,8 @@ class LauncherActivity : Activity() {
             cursorX = nx
             cursorY = ny
             renderer.updatePointer(cursorX, cursorY)
-            // Pure motion. When [pressed] the button is already held from the
-            // long-press grab; X keeps it down across motion events.
+            // Pure motion: if the left button is held from a long-press grab,
+            // X keeps it down across motion events.
             c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
         }
     }
@@ -531,6 +531,11 @@ class LauncherActivity : Activity() {
         val r = Runnable {
             if (!dragged && !grabbing) {
                 grabbing = true
+                // Button events use the pointer's current position, so make
+                // sure the X pointer really is at the on-screen cursor first:
+                // on a fresh connection no motion has been sent yet and the
+                // server pointer would still be at (0,0).
+                c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
                 c.sendButton(BUTTON_LEFT, true)
             }
         }
