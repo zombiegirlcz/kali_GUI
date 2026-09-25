@@ -1,0 +1,12 @@
+X11 desktop launcher for Kali NetHunter and ParrotOS Security running in PRoot containers on Android.
+
+Features:
+- Native X11 client/server architecture using Termux-X11
+- Hardware-accelerated OpenGL ES rendering
+- Near-zero latency direct X11 connection (replaces VNC)
+- Android to X11 event translation (touch, keyboard)
+- Full X11 feature set: clipboard, drag-and-drop, system tray
+- Seamless integration with kali_core_emulator (com.linux_core)
+- ADB reverse tunneling for secure X11 communication
+
+Requires running kali_core_emulator (com.linux_core) as the host container.
