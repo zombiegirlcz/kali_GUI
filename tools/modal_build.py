@@ -43,7 +43,19 @@ ANDROID_SDK_ROOT = "/opt/android-sdk"
 build_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 GITHUB_REPO = "zombiegirlcz/kali_GUI"
-GITHUB_BRANCH = "master"
+_DEFAULT_BRANCH = "master"
+
+
+def _detect_branch():
+    """Přečte aktuální větev z lokálního .git/HEAD (fallback na _DEFAULT_BRANCH)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    head_file = os.path.join(script_dir, ".git", "HEAD")
+    if os.path.isfile(head_file):
+        with open(head_file) as f:
+            content = f.read().strip()
+        if content.startswith("ref: refs/heads/"):
+            return content[len("ref: refs/heads/"):]
+    return _DEFAULT_BRANCH
 
 
 # ── Image with Android SDK + JDK 21 ─────────────────────────────────────────
@@ -78,24 +90,27 @@ base_image = (
     timeout=600,
     memory=1024,
 )
-def sync():
-    """Git clone (poprvé) nebo fetch + reset --hard (dál) přímo z GitHubu."""
+def sync(branch: str = ""):
+    """Git clone (poprvé) nebo fetch + reset --hard (dál) přímo z GitHubu.
+    Větev se čte z lokálního .git/HEAD (fallback na _DEFAULT_BRANCH)."""
+    if not branch:
+        branch = _DEFAULT_BRANCH
     token = os.environ.get("GITHUB_TOKEN", "")
     auth = f"{token}@" if token else ""
     repo_url = f"https://{auth}github.com/{GITHUB_REPO}.git"
     dest = "/vol/src"
 
     if os.path.isdir(os.path.join(dest, ".git")):
-        print(f"[sync] Repo už existuje na Volume — fetch + reset --hard origin/{GITHUB_BRANCH}")
+        print(f"[sync] Repo už existuje na Volume — fetch + reset --hard origin/{branch}")
         subprocess.run(["git", "remote", "set-url", "origin", repo_url], cwd=dest, check=True)
-        subprocess.run(["git", "fetch", "origin", GITHUB_BRANCH], cwd=dest, check=True)
-        subprocess.run(["git", "reset", "--hard", f"origin/{GITHUB_BRANCH}"], cwd=dest, check=True)
+        subprocess.run(["git", "fetch", "origin", branch], cwd=dest, check=True)
+        subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], cwd=dest, check=True)
     else:
-        print(f"[sync] Klonuji {GITHUB_REPO}@{GITHUB_BRANCH} -> {dest}")
+        print(f"[sync] Klonuji {GITHUB_REPO}@{branch} -> {dest}")
         if os.path.isdir(dest):
             shutil.rmtree(dest)
         subprocess.run(
-            ["git", "clone", "--branch", GITHUB_BRANCH, repo_url, dest],
+            ["git", "clone", "--branch", branch, repo_url, dest],
             check=True,
         )
 
@@ -104,7 +119,7 @@ def sync():
         cwd=dest, check=True,
     )
     build_vol.commit()
-    print("[sync] Hotovo.")
+    print(f"[sync] Hotovo ({branch}).")
 
 
 @app.function(
@@ -295,7 +310,7 @@ def main():
     if cmd == "init":
         init_keys.remote()
     elif cmd == "sync":
-        sync.remote()
+        sync.remote(branch=_detect_branch())
     elif cmd == "clean":
         clean.remote()
     elif cmd == "build":
