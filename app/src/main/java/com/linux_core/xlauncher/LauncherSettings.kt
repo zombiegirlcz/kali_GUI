@@ -3,19 +3,22 @@ package com.linux_core.xlauncher
 import android.content.Context
 import android.content.SharedPreferences
 
-/** What holding a finger still in MOUSE mode does. */
+/** What a still/held finger in MOUSE mode does. */
 enum class HoldAction {
     /**
-     * Plain hold (or hold after two taps) grabs the left button for dragging;
-     * one tap then hold right-clicks instead, and one tap then a swipe
-     * (instead of holding still) scrolls.
+     * Default scheme: tap = click. A second touch-down landing soon enough
+     * and close enough to a completed tap grabs the left button immediately
+     * (no timer) — "click, click, don't let go the second time" — for
+     * dragging. A plain hold with no prior tap right-clicks instead (after
+     * [LauncherSettings.longPressMs], same as two fingers held still).
+     * Two fingers dragged scrolls.
      */
     TAP_TAP_HOLD,
 
-    /** Hold always grabs the left button for dragging. No right-click via hold. */
+    /** Any single-finger hold grabs the left button for dragging. No tap-counting; right-click is two-finger-hold only. */
     GRAB_DRAG,
 
-    /** Hold always right-clicks. No drag-by-holding. */
+    /** Any single-finger hold right-clicks. No tap-counting, no drag-by-holding. */
     RIGHT_CLICK,
 }
 
@@ -36,7 +39,14 @@ class LauncherSettings(context: Context) {
         }
         set(value) = prefs.edit().putString(KEY_HOLD_ACTION, value.name).apply()
 
-    /** Delay in ms before a still finger counts as a hold. */
+    /**
+     * Delay in ms before a still finger/two fingers count as a hold. Used by
+     * the single-finger hold timer (right-click on a plain hold under
+     * [HoldAction.TAP_TAP_HOLD], right-click under [HoldAction.RIGHT_CLICK],
+     * grab under [HoldAction.GRAB_DRAG]) and by the two-finger
+     * hold-to-right-click gesture in all schemes. Only
+     * [HoldAction.TAP_TAP_HOLD]'s tap-then-hold *grab* skips this delay.
+     */
     var longPressMs: Long
         get() = prefs.getInt(KEY_LONG_PRESS_MS, DEFAULT_LONG_PRESS_MS).toLong()
         set(value) = prefs.edit()

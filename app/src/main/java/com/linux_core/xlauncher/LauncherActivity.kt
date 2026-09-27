@@ -38,9 +38,10 @@ import java.net.URL
  *   🖱   toggle between TOUCH (pointer follows finger) and MOUSE mode
  *        (trackpad-style: finger drags the cursor relative to where it
  *        already is, it does not jump under the finger. Clicks are gestures
- *        layered on top: tap = left click, tap+hold = right click,
- *        tap-tap+hold = grab the left button so dragging moves/resizes
- *        windows, tap+swipe = scroll)
+ *        layered on top: tap = left click, tap-tap+hold (click, click, and
+ *        don't let go the second time) = grab the left button so dragging
+ *        moves/resizes windows, plain hold (no prior tap) = right click,
+ *        two fingers held still = right click, two fingers dragged = scroll)
  *   Esc send ESC (Android IME has no Esc key)
  *
  * Connection overrides can be passed as intent extras: `host`, `port`.
@@ -93,26 +94,23 @@ class LauncherActivity : Activity() {
     private var grabbing = false
 
     /**
-     * Tap-count gesture state, one finger at a time. [recentTapCount] counts
-     * consecutive completed taps that landed within [doubleTapTimeoutMs] and
-     * [doubleTapSlopPx] of the previous one; anything slower or further away
-     * resets it to 0. It decides what the *next* touch does if it holds
-     * still or swipes instead of completing as a plain tap:
-     *   0 prior taps + hold  -> grab (left button held for dragging)
-     *   1 prior tap  + hold  -> right-click ("tap, hold")
-     *   1 prior tap  + swipe -> scroll ("tap, then drag")
-     *   2 prior taps + hold  -> grab (left button held for dragging)
-     * A quick tap (no hold, no swipe) always left-clicks and bumps the count.
+     * True once one finger completed a plain tap (down-up, no drag) within
+     * [doubleTapTimeoutMs] and [doubleTapSlopPx] of itself; a stale value
+     * (too slow or too far) resets to false on the next ACTION_DOWN. If the
+     * *next* touch-down lands while this is still true, that touch grabs the
+     * left button immediately — "click, click, and don't let go the second
+     * time" — instead of waiting on any timer. A plain first touch (this
+     * false) never grabs just by holding still — holding it instead
+     * right-clicks after a delay (see [scheduleLongPress]), so it never
+     * hijacks a drag that merely paused before moving.
      */
     private var recentTapCount = 0
     private var lastTapUpTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
 
-    /** True for the current gesture if it's the single-prior-tap case above. */
-    private var rightClickArmed = false
-
-    /** True once the current gesture's hold has already fired the right-click. */
+    /** True once the current gesture's hold has already fired the right-click
+     *  (GRAB_DRAG/RIGHT_CLICK [HoldAction] settings only — see [scheduleLongPress]). */
     private var rightClicked = false
 
     private val doubleTapTimeoutMs: Long by lazy {
@@ -122,19 +120,19 @@ class LauncherActivity : Activity() {
         android.view.ViewConfiguration.get(this).scaledDoubleTapSlop
     }
 
-    /**
-     * True once a [rightClickArmed] gesture swiped instead of holding still:
-     * from here to the finger lifting, vertical movement drives the mouse
-     * wheel instead of the cursor (see [onMouseTouch]'s ACTION_MOVE).
-     */
-    private var swipeScrolling = false
-    private var swipeScrollLastY = 0f
-    private var swipeScrollAccum = 0f
-
     /** Two-finger scroll bookkeeping (shared by both modes). */
     private var scrolling = false
     private var scrollLastY = 0f
     private var scrollAccum = 0f
+    private var scrollAnchorY = 0f
+
+    /**
+     * Pending timer for "two fingers held still" -> right-click, armed in
+     * MOUSE mode regardless of [HoldAction] (see [onScrollTouch]). Cancelled
+     * the moment the two fingers actually move.
+     */
+    private var twoFingerHoldRunnable: Runnable? = null
+    private var twoFingerRightClicked = false
 
     /**
      * True while the soft keyboard is actually showing. Kept in sync by a
@@ -251,15 +249,15 @@ class LauncherActivity : Activity() {
         }
         val optionTapTapHold = android.widget.RadioButton(this).apply {
             id = View.generateViewId()
-            text = "Ťuk, drž = pravý klik; ťuk, potáhni = scroll; obyčejné/dvojité podržení = tažení"
+            text = "Ťuk, ťuk a napodruhé nepustit = tažení; podržení bez ťuknutí / dva prsty drž = pravý klik; dva prsty táhni = scroll"
         }
         val optionGrabDrag = android.widget.RadioButton(this).apply {
             id = View.generateViewId()
-            text = "Podržení vždy táhne (žádný pravý klik podržením)"
+            text = "Podržení (i bez ťuknutí) vždy táhne — bez pravého kliku"
         }
         val optionRightClick = android.widget.RadioButton(this).apply {
             id = View.generateViewId()
-            text = "Podržení vždy = pravý klik (žádné tažení podržením)"
+            text = "Podržení (i bez ťuknutí) vždy = pravý klik — bez tažení podržením"
         }
         radioGroup.addView(optionTapTapHold)
         radioGroup.addView(optionGrabDrag)
@@ -330,7 +328,7 @@ class LauncherActivity : Activity() {
         cursorY = renderer.framebufferHeight / 2
         renderer.updatePointer(cursorX, cursorY)
         status.visibility = View.VISIBLE
-        status.text = if (mouseMode) "Mouse mode: drag = move, tap = click, tap+hold = right-click, tap-tap+hold = grab & drag, tap+swipe = scroll"
+        status.text = if (mouseMode) "Mouse mode: drag = move, tap = click, hold = right-click, tap-tap+hold = grab & drag, 2-finger drag = scroll"
                        else "Touch mode: pointer follows finger"
         Handler(Looper.getMainLooper()).postDelayed({
             if (!hadError && client != null) status.visibility = View.GONE
@@ -518,7 +516,6 @@ class LauncherActivity : Activity() {
             cancelLongPress()
             releaseGrab(c)
             recentTapCount = 0
-            swipeScrolling = false
             // A second finger turns a TOUCH-mode press into a scroll: drop the
             // button we had already pressed, otherwise X keeps it held down.
             if (directPressed) {
@@ -540,9 +537,14 @@ class LauncherActivity : Activity() {
     }
 
     /**
-     * TWO-FINGER SCROLL: the average Y of both fingers drives mouse-wheel
-     * button 4 (up) / 5 (down). Dragging the fingers down scrolls the view up,
-     * like a touchscreen.
+     * TWO-FINGER gesture: the average Y of both fingers drives mouse-wheel
+     * button 4 (up) / 5 (down) once they actually move — dragging the fingers
+     * down scrolls the view up, like a touchscreen. Holding both fingers
+     * still instead (MOUSE mode, any [HoldAction] scheme) right-clicks at the
+     * cursor after [LauncherSettings.longPressMs] — this is the only
+     * right-click gesture under [HoldAction.GRAB_DRAG], and redundant with
+     * (but harmless alongside) the single-finger hold under
+     * [HoldAction.RIGHT_CLICK].
      */
     private fun onScrollTouch(c: X11Client, event: MotionEvent): Boolean {
         val y = (event.getY(0) + event.getY(1)) / 2f
@@ -551,13 +553,25 @@ class LauncherActivity : Activity() {
                 scrolling = true
                 scrollAccum = 0f
                 scrollLastY = y
+                scrollAnchorY = y
+                twoFingerRightClicked = false
+                if (mouseMode) {
+                    scheduleTwoFingerHold(c)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 if (!scrolling) {
                     scrolling = true
                     scrollLastY = y
+                    scrollAnchorY = y
                     return true
                 }
+                if (twoFingerHoldRunnable != null &&
+                        kotlin.math.abs(y - scrollAnchorY) > tapSlopPx) {
+                    // Real movement: this is a scroll, not a held-still right-click.
+                    cancelTwoFingerHold()
+                }
+                if (twoFingerRightClicked) return true
                 val dy = y - scrollLastY
                 scrollLastY = y
                 scrollAccum += dy
@@ -573,15 +587,34 @@ class LauncherActivity : Activity() {
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
+                cancelTwoFingerHold()
                 scrolling = false
                 scrollAccum = 0f
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                cancelTwoFingerHold()
                 scrolling = false
                 scrollAccum = 0f
             }
         }
         return true
+    }
+
+    private fun scheduleTwoFingerHold(c: X11Client) {
+        cancelTwoFingerHold()
+        val r = Runnable {
+            twoFingerRightClicked = true
+            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
+            c.sendButton(BUTTON_RIGHT, true)
+            c.sendButton(BUTTON_RIGHT, false)
+        }
+        twoFingerHoldRunnable = r
+        Handler(Looper.getMainLooper()).postDelayed(r, settings.longPressMs)
+    }
+
+    private fun cancelTwoFingerHold() {
+        twoFingerHoldRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        twoFingerHoldRunnable = null
     }
 
     private fun wheel(c: X11Client, up: Boolean) {
@@ -611,11 +644,23 @@ class LauncherActivity : Activity() {
     /**
      * MOUSE mode: trackpad-style — dragging moves the cursor relative to
      * where it already is (motion only, no button), it does not jump under
-     * the finger. Clicking is a gesture layered on top: a short tap clicks
-     * the left button, a plain hold grabs it for dragging (windows), one
-     * prior tap plus a hold right-clicks instead, one prior tap plus a swipe
-     * scrolls instead, and two prior taps plus a hold grabs (same as a plain
-     * hold) — see [recentTapCount].
+     * the finger and a plain hold never grabs just by being held (it
+     * right-clicks instead — see below — so it never hijacks an ordinary
+     * drag that merely paused for a moment before moving).
+     *
+     * With the default [HoldAction.TAP_TAP_HOLD] scheme: a short tap clicks
+     * the left button; a second touch-down landing soon enough and close
+     * enough to a completed tap grabs the left button *immediately* (no
+     * timer) — "click, click, and don't let go the second time" — so
+     * dragging that second touch moves/resizes windows. A hold with no
+     * prior tap right-clicks instead, via [scheduleLongPress]. Two fingers
+     * held still also right-click, and two fingers dragged scroll — both
+     * handled in [onScrollTouch].
+     *
+     * The [HoldAction.GRAB_DRAG]/[HoldAction.RIGHT_CLICK] settings replace
+     * the single-finger half of this with a plain hold-to-grab/right-click
+     * for every hold (no tap needed first), for anyone who prefers that
+     * over tap-counting.
      */
     private fun onMouseTouch(c: X11Client, event: MotionEvent): Boolean {
         if (renderer.viewportWidth <= 0 || renderer.framebufferWidth <= 0) return true
@@ -630,38 +675,37 @@ class LauncherActivity : Activity() {
                 dragged = false
                 grabbing = false
                 rightClicked = false
-                swipeScrolling = false
                 val sinceLastTap = downTime - lastTapUpTime
                 val closeToLastTap = recentTapCount > 0 &&
                         sinceLastTap <= doubleTapTimeoutMs &&
                         distance(event.x, event.y, lastTapX, lastTapY) <= doubleTapSlopPx
                 if (!closeToLastTap) recentTapCount = 0
-                rightClickArmed = settings.holdAction == HoldAction.TAP_TAP_HOLD && recentTapCount == 1
-                // Hold still to grab (press & hold) and drag with the button
-                // down, or to right-click (if this is the second touch of a
-                // tap-then-hold) — a swipe instead of holding still scrolls in
-                // that same case, and a quick tap always just clicks.
-                scheduleLongPress(c)
+
+                when (settings.holdAction) {
+                    HoldAction.TAP_TAP_HOLD -> {
+                        if (recentTapCount >= 1) {
+                            // Second touch of "click, click, hold": grab now,
+                            // don't wait for a timer — not letting go IS the signal.
+                            grabbing = true
+                            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
+                            c.sendButton(BUTTON_LEFT, true)
+                        } else {
+                            // Plain first touch: no prior tap to grab off of,
+                            // so a hold-still instead right-clicks (a drag
+                            // before the timer fires cancels it, see below).
+                            scheduleLongPress(c)
+                        }
+                    }
+                    HoldAction.GRAB_DRAG, HoldAction.RIGHT_CLICK -> scheduleLongPress(c)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (swipeScrolling) {
-                    accumulateSwipeScroll(c, event.y)
-                    return true
-                }
                 // Cumulative travel since the gesture started decides tap vs drag.
                 val slopX = event.x - slopAnchorX
                 val slopY = event.y - slopAnchorY
                 if (!dragged && (slopX * slopX + slopY * slopY) > tapSlopPx * tapSlopPx) {
                     dragged = true
                     cancelLongPress()
-                    if (rightClickArmed) {
-                        // Swiped instead of holding still: scroll, don't drag.
-                        swipeScrolling = true
-                        swipeScrollLastY = event.y
-                        swipeScrollAccum = 0f
-                        recentTapCount = 0
-                        return true
-                    }
                     recentTapCount = 0
                 }
                 movePointer(c, event)
@@ -671,13 +715,11 @@ class LauncherActivity : Activity() {
             }
             MotionEvent.ACTION_UP -> {
                 cancelLongPress()
-                if (swipeScrolling) {
-                    swipeScrolling = false
-                    swipeScrollAccum = 0f
-                } else if (grabbing) {
+                if (grabbing) {
                     // End the grab: release the held button in place.
                     c.sendButton(BUTTON_LEFT, false)
                     grabbing = false
+                    recentTapCount = 0
                 } else if (rightClicked) {
                     // Already fired by the hold timer; nothing left to do.
                 } else if (!dragged) {
@@ -687,9 +729,9 @@ class LauncherActivity : Activity() {
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, true)
                     c.sendPointer(cursorX, cursorY, BUTTON_LEFT, false)
-                    // Register this as a tap so a hold/swipe on the next touch
-                    // (if it lands close by, soon enough) can right-click/scroll.
-                    recentTapCount = (recentTapCount + 1).coerceAtMost(2)
+                    // Register this as a tap so a second touch landing close by,
+                    // soon enough, grabs instead of clicking (tap-tap-hold).
+                    recentTapCount = 1
                     lastTapUpTime = System.currentTimeMillis()
                     lastTapX = event.x
                     lastTapY = event.y
@@ -701,8 +743,6 @@ class LauncherActivity : Activity() {
                 releaseGrab(c)
                 dragged = false
                 recentTapCount = 0
-                swipeScrolling = false
-                swipeScrollAccum = 0f
             }
         }
         return true
@@ -712,26 +752,6 @@ class LauncherActivity : Activity() {
         val dx = x1 - x2
         val dy = y1 - y2
         return kotlin.math.sqrt(dx * dx + dy * dy)
-    }
-
-    /**
-     * Single-finger equivalent of [onScrollTouch]'s wheel accumulator, driven
-     * by a tap-then-swipe gesture instead of a second finger. Same notch size
-     * so both scroll gestures feel the same.
-     */
-    private fun accumulateSwipeScroll(c: X11Client, y: Float) {
-        val dy = y - swipeScrollLastY
-        swipeScrollLastY = y
-        swipeScrollAccum += dy
-        val notch = 24f * resources.displayMetrics.density
-        while (swipeScrollAccum <= -notch) {
-            swipeScrollAccum += notch
-            wheel(c, up = false)
-        }
-        while (swipeScrollAccum >= notch) {
-            swipeScrollAccum -= notch
-            wheel(c, up = true)
-        }
     }
 
     /** Applies one-finger motion to the cursor (pure motion, no button change). */
@@ -750,6 +770,13 @@ class LauncherActivity : Activity() {
         }
     }
 
+    /**
+     * Plain single-finger hold-to-grab/right-click. Used by
+     * [HoldAction.GRAB_DRAG] (grab) and [HoldAction.RIGHT_CLICK] (right-click)
+     * for every hold, and by the default [HoldAction.TAP_TAP_HOLD] scheme
+     * for a hold with no prior tap (right-click) — tap-then-hold instead
+     * grabs immediately without this timer (see [onMouseTouch]).
+     */
     private fun scheduleLongPress(c: X11Client) {
         cancelLongPress()
         val r = Runnable {
@@ -759,19 +786,14 @@ class LauncherActivity : Activity() {
                 // on a fresh connection no motion has been sent yet and the
                 // server pointer would still be at (0,0).
                 c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                val doRightClick = when (settings.holdAction) {
-                    HoldAction.RIGHT_CLICK -> true
-                    HoldAction.GRAB_DRAG -> false
-                    HoldAction.TAP_TAP_HOLD -> rightClickArmed
-                }
-                if (doRightClick) {
-                    rightClicked = true
-                    recentTapCount = 0
-                    c.sendButton(BUTTON_RIGHT, true)
-                    c.sendButton(BUTTON_RIGHT, false)
-                } else {
+                if (settings.holdAction == HoldAction.GRAB_DRAG) {
                     grabbing = true
                     c.sendButton(BUTTON_LEFT, true)
+                } else {
+                    // RIGHT_CLICK setting, or TAP_TAP_HOLD's plain-hold case.
+                    rightClicked = true
+                    c.sendButton(BUTTON_RIGHT, true)
+                    c.sendButton(BUTTON_RIGHT, false)
                 }
             }
         }
