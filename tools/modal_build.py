@@ -102,7 +102,13 @@ base_image = (
 )
 def sync(branch: str = ""):
     """Git clone (poprvé) nebo fetch + reset --hard (dál) přímo z GitHubu.
-    Větev se čte z lokálního .git/HEAD (fallback na _DEFAULT_BRANCH)."""
+
+    `branch` by měl vždy přijít explicitně od volajícího (mbuild předává
+    aktuální lokální branch přes `--branch`). Prázdná hodnota nastane jen
+    při volání bez tohoto argumentu (např. `modal run modal_build.py::sync`
+    ručně) a spadne na _DEFAULT_BRANCH — NE na _detect_branch(), ta běží
+    jen v main()/local_entrypoint, kam se přes `::sync` vůbec nedostaneš.
+    """
     if not branch:
         branch = _DEFAULT_BRANCH
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -209,6 +215,16 @@ def build():
             file=sys.stderr,
         )
         sys.exit(1)
+
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=src_dir, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    commit = subprocess.run(
+        ["git", "log", "-1", "--format=%h %s"],
+        cwd=src_dir, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    print(f"[build] Building from branch '{branch}': {commit}")
 
     with open(os.path.join(src_dir, "local.properties"), "w") as f:
         f.write(f"sdk.dir={ANDROID_SDK_ROOT}\n")
