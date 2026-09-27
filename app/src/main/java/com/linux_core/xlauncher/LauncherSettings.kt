@@ -5,7 +5,11 @@ import android.content.SharedPreferences
 
 /** What holding a finger still in MOUSE mode does. */
 enum class HoldAction {
-    /** Plain hold grabs the left button for dragging; two-tap-then-hold right-clicks. */
+    /**
+     * Plain hold (or hold after two taps) grabs the left button for dragging;
+     * one tap then hold right-clicks instead, and one tap then a swipe
+     * (instead of holding still) scrolls.
+     */
     TAP_TAP_HOLD,
 
     /** Hold always grabs the left button for dragging. No right-click via hold. */
