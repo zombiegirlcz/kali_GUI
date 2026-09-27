@@ -33,7 +33,8 @@ build.log
 captures/
 .externalNativeBuild/
 .cxx/
-
+__pycache__
+tools/__pycache__
 # pi agent state dir
 .pi/
 #core apk

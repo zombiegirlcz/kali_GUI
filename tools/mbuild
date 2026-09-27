@@ -2,15 +2,15 @@
 # mbuild — Kali GUI build pipeline
 # Usage: zsh mbuild <command>
 #
-# SYNC (vždy samostatně, před buildem):
-#   sync  = git clone/pull PŘÍMO Z GITHUBU na Modal straně
+# SYNC (samostatně, bez buildu):
+#   sync  = git fetch + reset --hard origin/<aktuální lokální branch> na Modal straně
 #   clean = smaže src + gradle-cache na Volume (builds zůstávají)
 #
-# BUILD:
-#   build    = Gradle APK build + download APK
-#   all      = sync + Gradle build + download APK
+# BUILD (vždy nejdřív sync na aktuální branch, pak Gradle):
+#   build = sync + Gradle build + download APK
+#   all   = alias pro build
 #
-# Než spustíš sync, musíš mít lokální commity na GitHubu:
+# Než spustíš sync/build, musíš mít lokální commity na GitHubu:
 #   git add -A && git commit -m "..." && git push
 set -e
 set -o pipefail
@@ -20,24 +20,25 @@ CMD="${1:-}"
 
 cd "$SRC"
 
+# Aktuální lokální branch — jde vždy explicitně jako --branch do modal_build.py::sync.
+# `modal run modal_build.py::sync` volá funkci PŘÍMO a obchází local_entrypoint (main()),
+# takže _detect_branch() uvnitř modal_build.py se v tomto volání nikdy nespustí — bez
+# tohoto by sync vždy spadl na fallback "master" bez ohledu na to, na jaké branch jsi.
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo master)"
+
 case "$CMD" in
     sync)
-        echo "=== SYNC (git clone/pull z GitHubu) ==="
-        modal run modal_build.py::sync 2>&1 | tail -10
+        echo "=== SYNC (git fetch + reset --hard origin/${BRANCH}) ==="
+        modal run modal_build.py::sync --branch "$BRANCH" 2>&1 | tail -10
         ;;
     clean)
         echo "=== CLEAN (smaže src + gradle-cache na Volume) ==="
         modal run modal_build.py::clean 2>&1 | tail -5
         ;;
-    all)
-        echo "=== BUILD (sync + Gradle) ==="
-        modal run modal_build.py::sync > build.log | cat
+    all|build)
+        echo "=== BUILD (sync + Gradle, branch: ${BRANCH}) ==="
+        modal run modal_build.py::sync --branch "$BRANCH" > build.log | cat
         modal run modal_build.py::build >> build.log | cat
-        modal volume get --force kali-gui-build-data builds/kali-gui-debug.apk ~/Download/kali_gui.apk 2>&1 || true
-        ;;
-    build)
-        echo "=== GRADLE BUILD ==="
-        modal run modal_build.py::build > build.log | cat
         modal volume get --force kali-gui-build-data builds/kali-gui-debug.apk ~/Download/kali_gui.apk 2>&1 || true
         ;;
     *)
