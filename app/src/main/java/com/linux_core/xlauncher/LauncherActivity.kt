@@ -87,6 +87,16 @@ class LauncherActivity : Activity() {
         (12f * resources.displayMetrics.density)
     }
 
+    /**
+     * Single Handler used to schedule AND cancel every gesture timer below
+     * (long-press and two-finger-hold). A fresh Handler() has its own
+     * identity, so removeCallbacks() on a different instance than the one
+     * that posted the Runnable is a silent no-op — the timer fires anyway,
+     * long after the finger already lifted. Must stay one shared instance
+     * per timer for cancellation to actually work.
+     */
+    private val gestureTimerHandler = Handler(Looper.getMainLooper())
+
     /** Pending long-press timer: hold still to grab (press & hold the button). */
     private var longPressRunnable: Runnable? = null
 
@@ -609,11 +619,11 @@ class LauncherActivity : Activity() {
             c.sendButton(BUTTON_RIGHT, false)
         }
         twoFingerHoldRunnable = r
-        Handler(Looper.getMainLooper()).postDelayed(r, settings.longPressMs)
+        gestureTimerHandler.postDelayed(r, settings.longPressMs)
     }
 
     private fun cancelTwoFingerHold() {
-        twoFingerHoldRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        twoFingerHoldRunnable?.let { gestureTimerHandler.removeCallbacks(it) }
         twoFingerHoldRunnable = null
     }
 
@@ -798,11 +808,11 @@ class LauncherActivity : Activity() {
             }
         }
         longPressRunnable = r
-        Handler(Looper.getMainLooper()).postDelayed(r, settings.longPressMs)
+        gestureTimerHandler.postDelayed(r, settings.longPressMs)
     }
 
     private fun cancelLongPress() {
-        longPressRunnable?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+        longPressRunnable?.let { gestureTimerHandler.removeCallbacks(it) }
         longPressRunnable = null
     }
 
