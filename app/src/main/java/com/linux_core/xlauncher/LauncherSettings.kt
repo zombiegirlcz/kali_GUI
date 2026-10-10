@@ -53,14 +53,52 @@ class LauncherSettings(context: Context) {
                 .putInt(KEY_LONG_PRESS_MS, value.toInt().coerceIn(MIN_LONG_PRESS_MS, MAX_LONG_PRESS_MS))
                 .apply()
 
+    /**
+     * When true the viewer connects to [remoteHost]:[remotePort] instead of
+     * the local guest's X server. Lets the same APK drive a desktop running on
+     * another machine (laptop, VPS) without rebuilding or passing extras.
+     */
+    var remoteEnabled: Boolean
+        get() = prefs.getBoolean(KEY_REMOTE_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_REMOTE_ENABLED, value).apply()
+
+    /** Host of the remote X server. Kept even while [remoteEnabled] is off. */
+    var remoteHost: String
+        get() = prefs.getString(KEY_REMOTE_HOST, "")?.trim() ?: ""
+        set(value) = prefs.edit().putString(KEY_REMOTE_HOST, value.trim()).apply()
+
+    /** TCP port of the remote X server (6000 + display number). */
+    var remotePort: Int
+        get() = prefs.getInt(KEY_REMOTE_PORT, ConnectionConfig.DEFAULT.port)
+        set(value) = prefs.edit()
+                .putInt(KEY_REMOTE_PORT, value.coerceIn(MIN_PORT, MAX_PORT))
+                .apply()
+
+    /**
+     * The remote target, or null when remote mode is off or no host was ever
+     * entered — the caller then falls back to the local config.
+     */
+    fun remoteConfig(): ConnectionConfig? {
+        if (!remoteEnabled) return null
+        val host = remoteHost
+        if (host.isEmpty()) return null
+        return ConnectionConfig(host, remotePort)
+    }
+
     companion object {
         private const val PREFS_NAME = "xlauncher_settings"
         private const val KEY_HOLD_ACTION = "hold_action"
         private const val KEY_LONG_PRESS_MS = "long_press_ms"
+        private const val KEY_REMOTE_ENABLED = "remote_enabled"
+        private const val KEY_REMOTE_HOST = "remote_host"
+        private const val KEY_REMOTE_PORT = "remote_port"
 
         val DEFAULT_HOLD_ACTION = HoldAction.TAP_TAP_HOLD
         const val DEFAULT_LONG_PRESS_MS = 400
         const val MIN_LONG_PRESS_MS = 200
         const val MAX_LONG_PRESS_MS = 800
+
+        const val MIN_PORT = 1
+        const val MAX_PORT = 65535
     }
 }

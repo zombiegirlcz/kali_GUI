@@ -43,6 +43,8 @@ import java.net.URL
  *        moves/resizes windows, plain hold (no prior tap) = right click,
  *        two fingers held still = right click, two fingers dragged = scroll)
  *   Esc send ESC (Android IME has no Esc key)
+ *   🌐  remote target: connect to an X server on another machine
+ *        instead of the local guest (host/port, persisted)
  *
  * Connection overrides can be passed as intent extras: `host`, `port`.
  */
@@ -58,6 +60,16 @@ class LauncherActivity : Activity() {
 
     private var client: X11Client? = null
     private var hadError = false
+
+    /** Target used when remote mode is off: intent extras, else the local guest. */
+    private lateinit var localConfig: ConnectionConfig
+
+    /**
+     * Bumped on every (re)connect. The client runs on its own thread and its
+     * callbacks can land after the user already switched targets, so each
+     * listener ignores anything that is not from the current generation.
+     */
+    private var connectionGeneration = 0
 
     /** false = touch (pointer follows finger), true = mouse (drag cursor). */
     private var mouseMode = false
@@ -208,14 +220,32 @@ class LauncherActivity : Activity() {
 
         glView.setOnTouchListener { _, event -> onDesktopTouch(event) }
 
-        val config = intent.extras?.let { e ->
+        localConfig = intent.extras?.let { e ->
             ConnectionConfig(
                     e.getString("host") ?: ConnectionConfig.DEFAULT.host,
                     e.getInt("port", ConnectionConfig.DEFAULT.port))
         } ?: ConnectionConfig.DEFAULT
 
+        connectTo(settings.remoteConfig() ?: localConfig)
+    }
+
+    /**
+     * Drops any live connection and connects to [config]. Used both for the
+     * initial connect and when the remote target changes, so switching hosts
+     * never leaves two clients feeding the renderer.
+     */
+    private fun connectTo(config: ConnectionConfig) {
+        connectionGeneration++
+        client?.disconnect()
+        client = null
+        hadError = false
+        grabbing = false
+        directPressed = false
+        cancelLongPress()
+        cancelTwoFingerHold()
+        status.visibility = View.VISIBLE
         status.text = getString(R.string.status_connecting, config.host, config.port)
-        startConnection(config)
+        startConnection(config, connectionGeneration)
     }
 
     /* ------------------------------------------------------------------ */
@@ -233,12 +263,14 @@ class LauncherActivity : Activity() {
         modeButton = controlButton(modeLabel()) { toggleMode() }
         val esc = controlButton("Esc") { sendEscape() }
         val term = controlButton("⌘") { openTerminal() }
+        val remote = controlButton("🌐") { showRemoteDialog() }
         val gear = controlButton("⚙") { showSettingsDialog() }
 
         bar.addView(kb)
         bar.addView(modeButton)
         bar.addView(esc)
         bar.addView(term)
+        bar.addView(remote)
         bar.addView(gear)
         return bar
     }
@@ -314,6 +346,84 @@ class LauncherActivity : Activity() {
                 .setView(container)
                 .setPositiveButton("Hotovo", null)
                 .show()
+    }
+
+    /**
+     * Lets the viewer point at an X server on another machine instead of the
+     * one inside the local guest: a switch plus host/port, persisted in
+     * [LauncherSettings]. Confirming reconnects immediately, so the change is
+     * visible without restarting the app.
+     */
+    private fun showRemoteDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 8)
+        }
+
+        val toggle = android.widget.CheckBox(this).apply {
+            text = "Připojit se ke vzdálenému X serveru"
+            isChecked = settings.remoteEnabled
+        }
+        container.addView(toggle)
+
+        val localHint = TextView(this).apply {
+            setPadding(0, 8, 0, 24)
+            text = "Vypnuto = lokální plocha v kontejneru (${localConfig.host}:${localConfig.port})"
+        }
+        container.addView(localHint)
+
+        val hostField = EditText(this).apply {
+            hint = "Adresa (např. 192.168.1.50)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(settings.remoteHost)
+        }
+        container.addView(hostField)
+
+        val portField = EditText(this).apply {
+            hint = "Port (6000 + číslo displeje)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(settings.remotePort.toString())
+        }
+        container.addView(portField)
+
+        fun applyEnabled(enabled: Boolean) {
+            hostField.isEnabled = enabled
+            portField.isEnabled = enabled
+        }
+        applyEnabled(toggle.isChecked)
+        toggle.setOnCheckedChangeListener { _, checked -> applyEnabled(checked) }
+
+        val dialog = android.app.AlertDialog.Builder(this)
+                .setTitle("Vzdálená plocha")
+                .setView(container)
+                .setNegativeButton("Zrušit", null)
+                .setPositiveButton("Připojit", null)
+                .create()
+
+        dialog.show()
+        // Validation needs to keep the dialog open on bad input, which the
+        // builder's own listener cannot do — it always dismisses.
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val enabled = toggle.isChecked
+            val host = hostField.text.toString().trim()
+            val port = portField.text.toString().trim().toIntOrNull()
+
+            if (enabled && host.isEmpty()) {
+                hostField.error = "Zadej adresu"
+                return@setOnClickListener
+            }
+            if (enabled && (port == null || port < LauncherSettings.MIN_PORT || port > LauncherSettings.MAX_PORT)) {
+                portField.error = "Port 1–65535"
+                return@setOnClickListener
+            }
+
+            settings.remoteEnabled = enabled
+            settings.remoteHost = host
+            if (port != null) settings.remotePort = port
+
+            dialog.dismiss()
+            connectTo(settings.remoteConfig() ?: localConfig)
+        }
     }
 
     private fun controlButton(label: String, onClick: () -> Unit): TextView =
@@ -452,13 +562,20 @@ class LauncherActivity : Activity() {
         return super.dispatchKeyEvent(event)
     }
 
-    private fun startConnection(config: ConnectionConfig) {
+    private fun startConnection(config: ConnectionConfig, generation: Int) {
         Thread({
             val c = X11Client()
+            if (generation != connectionGeneration) {
+                c.disconnect()
+                return@Thread
+            }
             client = c
 
             val listener = object : X11Client.Listener {
+                private fun stale(): Boolean = generation != connectionGeneration
+
                 override fun onConnected(width: Int, height: Int) = runOnUiThread {
+                    if (stale()) return@runOnUiThread
                     hadError = false
                     status.visibility = View.GONE
                     cursorX = width / 2
@@ -468,10 +585,12 @@ class LauncherActivity : Activity() {
                 }
 
                 override fun onFramebuffer(width: Int, height: Int, pixels: IntArray) {
+                    if (stale()) return
                     renderer.updateFramebuffer(width, height, pixels)
                 }
 
                 override fun onDisconnected() = runOnUiThread {
+                    if (stale()) return@runOnUiThread
                     if (!isFinishing && !hadError) {
                         status.visibility = View.VISIBLE
                         status.text = getString(R.string.status_disconnected)
@@ -480,6 +599,7 @@ class LauncherActivity : Activity() {
 
                 override fun onError(t: Throwable) = runOnUiThread {
                     Log.e(TAG, "X11 error", t)
+                    if (stale()) return@runOnUiThread
                     hadError = true
                     status.visibility = View.VISIBLE
                     status.text = describeError(t)
