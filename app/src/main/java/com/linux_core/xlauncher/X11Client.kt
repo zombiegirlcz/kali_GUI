@@ -116,6 +116,17 @@ class X11Client {
         private set
 
     /**
+     * Diagnostics. If the screen never updates while [damageActive] is true,
+     * these two numbers tell the whole story: [damageEventCount] staying at 0
+     * means the server accepted DamageCreate but never reports anything (the
+     * client is blind and, by design, silent), while a growing count with no
+     * fetches would point at the accumulate/box logic instead.
+     */
+    private var damageEventCount = 0L
+    private var regionFetchCount = 0L
+    private var fullFetchCount = 0L
+
+    /**
      * Accumulated damage, as a bounding box grown over every `DamageNotify`
      * seen since the last fetch. A union is deliberate: one `GetImage` for the
      * bounding box is fewer round trips than one per rectangle, and X11
@@ -393,11 +404,26 @@ class X11Client {
      * `DamageNotify` that contributed to the dirty region.
      */
     private fun dispatchEvent(pkt: XPacket): Boolean {
-        if (!damageActive || pkt.type != damageEventBase) return false
+        if (!damageActive || pkt.type != damageEventBase) {
+            // Not every stray packet is noise worth ignoring silently: an
+            // event with a *different* type while DAMAGE is on is a real
+            // signal (wrong event base, or another extension's event).
+            if (pkt.type != X_REPLY && pkt.type != X_ERROR) {
+                Log.i(TAG, "non-damage event type=${pkt.type} (expected $damageEventBase)")
+            }
+            return false
+        }
         // DamageNotify: type(1) level(1) sequence(2) drawable(4) damage(4)
         // timestamp(4) area.x(2) area.y(2) area.w(2) area.h(2) geometry...
-        accumulate(be16(pkt.data, 16), be16(pkt.data, 18),
-                be16(pkt.data, 20), be16(pkt.data, 22))
+        val ax = be16(pkt.data, 16)
+        val ay = be16(pkt.data, 18)
+        val aw = be16(pkt.data, 20)
+        val ah = be16(pkt.data, 22)
+        damageEventCount++
+        if (damageEventCount <= 5 || damageEventCount % 200 == 0L) {
+            Log.i(TAG, "DamageNotify #$damageEventCount area=($ax,$ay,$aw,$ah)")
+        }
+        accumulate(ax, ay, aw, ah)
         return true
     }
 
@@ -498,10 +524,59 @@ class X11Client {
         damageOpcode = ext.majorOpcode
         damageEventBase = ext.firstEvent
         damageXid = resourceIdBase or DAMAGE_XID_OFFSET
-        damageCreate(damageOpcode, damageXid, rootWindow, DAMAGE_RAW_RECTANGLES)
+
+        // dispatchEvent() ignores DamageNotify unless damageActive is set, and
+        // the confirmation round trip below has to see them — so flip the flag
+        // first and undo it if the subscription turns out not to exist.
         damageActive = true
+        damageCreate(damageOpcode, damageXid, rootWindow, DAMAGE_RAW_RECTANGLES)
+
+        // DamageCreate has no reply of its own, and that is the trap: a
+        // rejection (BadIdChoice, BadValue, BadAlloc) would sit unread in the
+        // stream while the loop parks forever on a subscription that does not
+        // exist. The result is a frozen picture with *zero* traffic — exactly
+        // what a silently unsupported DAMAGE looks like, and impossible to
+        // tell from an idle desktop once the loop is running.
+        //
+        // GetInputFocus does have a reply, so a single round trip flushes any
+        // pending error. And DamageCreate is required to emit one seed
+        // DamageNotify covering the whole drawable, so seeing that event is
+        // positive proof the subscription is live — no guessing, no canary
+        // draw, and an idle desktop still costs nothing.
+        val sawError = syncForErrors()
+        if (sawError || damageEventCount == 0L) {
+            Log.w(TAG, "DAMAGE not confirmed (error=$sawError, seedEvents=$damageEventCount); " +
+                    "falling back to full-frame polling")
+            damageActive = false
+            return
+        }
         Log.i(TAG, "DAMAGE active (opcode=$damageOpcode eventBase=$damageEventBase " +
-                "damageId=${hex(damageXid)}) — partial GetImage enabled")
+                "damageId=${hex(damageXid)}) — partial GetImage enabled, " +
+                "seed damage ($dmgMinX,$dmgMinY)-($dmgMaxX,$dmgMaxY)")
+    }
+
+    /**
+     * Sends `GetInputFocus` (a request with a guaranteed reply) and reads until
+     * that reply arrives. Returns true when an X error was seen on the way —
+     * i.e. some earlier request without a reply of its own was rejected.
+     */
+    private fun syncForErrors(): Boolean {
+        val out = output ?: return true
+        synchronized(writeLock) {
+            out.writeByte(OP_GET_INPUT_FOCUS)
+            out.writeByte(0)
+            out.writeShort(1)
+            out.flush()
+        }
+        var sawError = false
+        while (true) {
+            val pkt = readPacket(readTimeoutMs) ?: return sawError
+            when (pkt.type) {
+                X_ERROR -> sawError = true
+                X_REPLY -> return sawError
+                else -> dispatchEvent(pkt)
+            }
+        }
     }
 
     /** Grows the dirty bounding box by one rectangle, clamped to the screen. */
@@ -602,6 +677,10 @@ class X11Client {
                     publishFrame(full, w, h, listener)
                     seeded = true
                     publishedFull = true
+                    fullFetchCount++
+                    if (fullFetchCount <= 3) {
+                        Log.i(TAG, "full frame #$fullFetchCount ($bytes B, seed=${!seeded})")
+                    }
                 }
                 clearDamage()
             } else if (box != null) {
@@ -613,6 +692,10 @@ class X11Client {
                 val bytes = getImage(x, y, bw, bh, patch)
                 if (bytes > 0) {
                     publishRegion(x, y, bw, bh, patch, listener)
+                    regionFetchCount++
+                    if (regionFetchCount <= 5 || regionFetchCount % 200 == 0L) {
+                        Log.i(TAG, "region #$regionFetchCount ($x,$y,$bw,$bh) $bytes B")
+                    }
                 }
                 clearDamage()
             }
@@ -875,6 +958,9 @@ class X11Client {
 
         const val OP_GET_IMAGE = 73
         const val OP_QUERY_EXTENSION = 98
+
+        /** Has a reply, so it can be used to flush and detect pending errors. */
+        const val OP_GET_INPUT_FOCUS = 43
         const val ZPIXMAP = 2
 
         const val XTEST_OPCODE = 132
