@@ -72,6 +72,16 @@ class X11Client {
     /** True when the server sends ZPixmap data least-significant-byte first. */
     private var imageLsbFirst = false
 
+    /**
+     * How long to wait between `GetImage` requests, and how long a single read
+     * may block. Both are decided in [connect] from whether the target is
+     * loopback or across a network: a full-screen `GetImage` is several MB, so
+     * loopback pacing on a Wi-Fi link saturates the socket, reads stall past
+     * the timeout and the session dies mid-reply.
+     */
+    private var frameIntervalMs = LOCAL_FRAME_INTERVAL_MS
+    private var readTimeoutMs = LOCAL_READ_TIMEOUT_MS
+
     /** Double buffered framebuffers, swapped on every published frame. */
     private var frameA: IntArray? = null
     private var frameB: IntArray? = null
@@ -86,7 +96,16 @@ class X11Client {
             val sock = Socket()
             sock.tcpNoDelay = true
             sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
-            sock.soTimeout = READ_TIMEOUT_MS
+
+            // Resolved address, not the typed host: "localhost", an explicit
+            // 127.0.0.1 and a LAN IP must be told apart by what we actually
+            // reached, not by how it was spelled.
+            val loopback = sock.inetAddress?.isLoopbackAddress ?: true
+            frameIntervalMs = if (loopback) LOCAL_FRAME_INTERVAL_MS else REMOTE_FRAME_INTERVAL_MS
+            readTimeoutMs = if (loopback) LOCAL_READ_TIMEOUT_MS else REMOTE_READ_TIMEOUT_MS
+            sock.soTimeout = readTimeoutMs
+            Log.i(TAG, "connected to ${config.host}:${config.port} " +
+                    "(loopback=$loopback, interval=${frameIntervalMs}ms, readTimeout=${readTimeoutMs}ms)")
             socket = sock
             input = DataInputStream(BufferedInputStream(sock.getInputStream(), 64 * 1024))
             output = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
@@ -282,7 +301,7 @@ class X11Client {
             }
 
             val elapsed = System.currentTimeMillis() - started
-            val sleep = FRAME_INTERVAL_MS - elapsed
+            val sleep = frameIntervalMs - elapsed
             if (sleep > 0) {
                 try {
                     Thread.sleep(sleep)
@@ -517,10 +536,25 @@ class X11Client {
         const val EV_MOTION = 6
 
         const val CONNECT_TIMEOUT_MS = 5000
-        const val READ_TIMEOUT_MS = 15000
+
+        const val LOCAL_READ_TIMEOUT_MS = 15000
+
+        /**
+         * Generous on purpose. A remote full-screen `GetImage` is several MB
+         * and a slow link can legitimately take tens of seconds; a read that
+         * times out cannot be retried, because it leaves the reply stream
+         * desynchronised and forces a whole reconnect.
+         */
+        const val REMOTE_READ_TIMEOUT_MS = 45000
 
         /** ~15 fps. GetImage over loopback is cheap but not free. */
-        const val FRAME_INTERVAL_MS = 66L
+        const val LOCAL_FRAME_INTERVAL_MS = 66L
+
+        /**
+         * ~3 fps. Still far more than a network link can carry at full frame
+         * size, but it stops requests from piling up faster than replies drain.
+         */
+        const val REMOTE_FRAME_INTERVAL_MS = 300L
 
         fun pad4(n: Int): Int = (4 - (n and 3)) and 3
 

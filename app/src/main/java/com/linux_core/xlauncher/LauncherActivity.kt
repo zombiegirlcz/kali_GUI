@@ -71,6 +71,21 @@ class LauncherActivity : Activity() {
      */
     private var connectionGeneration = 0
 
+    /** Target of the current connection, retried as-is by the auto-reconnect. */
+    private var activeConfig: ConnectionConfig? = null
+
+    /** Consecutive failed attempts; drives the backoff and resets on success. */
+    private var reconnectAttempt = 0
+
+    /** Last error text, kept so the retry countdown can keep showing the cause. */
+    private var lastErrorText: String? = null
+
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private var pendingReconnect: Runnable? = null
+
+    /** Set in [onDestroy]: stops the retry loop from outliving the activity. */
+    private var destroyed = false
+
     /** false = touch (pointer follows finger), true = mouse (drag cursor). */
     private var mouseMode = false
 
@@ -234,10 +249,16 @@ class LauncherActivity : Activity() {
      * initial connect and when the remote target changes, so switching hosts
      * never leaves two clients feeding the renderer.
      */
-    private fun connectTo(config: ConnectionConfig) {
+    private fun connectTo(config: ConnectionConfig, userInitiated: Boolean = true) {
         connectionGeneration++
+        cancelPendingReconnect()
+        if (userInitiated) {
+            reconnectAttempt = 0
+            lastErrorText = null
+        }
         client?.disconnect()
         client = null
+        activeConfig = config
         hadError = false
         grabbing = false
         directPressed = false
@@ -246,6 +267,45 @@ class LauncherActivity : Activity() {
         status.visibility = View.VISIBLE
         status.text = getString(R.string.status_connecting, config.host, config.port)
         startConnection(config, connectionGeneration)
+    }
+
+    /**
+     * Retries the current target after a dropped connection, with exponential
+     * backoff capped at [MAX_RECONNECT_DELAY_MS]. Dropping out on a read
+     * timeout is normal on a slow link (a full-screen GetImage is several MB),
+     * and the stream cannot be resumed afterwards — reconnecting is the only
+     * recovery, and doing it here means a stall no longer needs an app restart.
+     */
+    private fun scheduleReconnect() {
+        val config = activeConfig ?: return
+        if (destroyed || isFinishing) return
+
+        reconnectAttempt++
+        // The shift count must be clamped: retries are unbounded, and Long.shl
+        // takes it mod 64, so attempt 65 would wrap back to a 1 s delay.
+        val shift = (reconnectAttempt - 1).coerceIn(0, MAX_BACKOFF_SHIFT)
+        val delay = (INITIAL_RECONNECT_DELAY_MS shl shift)
+                .coerceAtMost(MAX_RECONNECT_DELAY_MS)
+
+        status.visibility = View.VISIBLE
+        status.text = buildString {
+            lastErrorText?.let { append(it).append("\n\n") }
+            append(getString(
+                    R.string.status_reconnecting,
+                    config.host, config.port, delay / 1000, reconnectAttempt))
+        }
+
+        val r = Runnable {
+            pendingReconnect = null
+            connectTo(config, userInitiated = false)
+        }
+        pendingReconnect = r
+        reconnectHandler.postDelayed(r, delay)
+    }
+
+    private fun cancelPendingReconnect() {
+        pendingReconnect?.let { reconnectHandler.removeCallbacks(it) }
+        pendingReconnect = null
     }
 
     /* ------------------------------------------------------------------ */
@@ -577,6 +637,8 @@ class LauncherActivity : Activity() {
                 override fun onConnected(width: Int, height: Int) = runOnUiThread {
                     if (stale()) return@runOnUiThread
                     hadError = false
+                    reconnectAttempt = 0
+                    lastErrorText = null
                     status.visibility = View.GONE
                     cursorX = width / 2
                     cursorY = height / 2
@@ -589,20 +651,22 @@ class LauncherActivity : Activity() {
                     renderer.updateFramebuffer(width, height, pixels)
                 }
 
+                // X11Client's finally block always lands here, including
+                // after onError, so this is the single place that retries.
                 override fun onDisconnected() = runOnUiThread {
                     if (stale()) return@runOnUiThread
-                    if (!isFinishing && !hadError) {
-                        status.visibility = View.VISIBLE
-                        status.text = getString(R.string.status_disconnected)
-                    }
+                    if (destroyed || isFinishing) return@runOnUiThread
+                    if (!hadError) lastErrorText = getString(R.string.status_disconnected)
+                    scheduleReconnect()
                 }
 
                 override fun onError(t: Throwable) = runOnUiThread {
                     Log.e(TAG, "X11 error", t)
                     if (stale()) return@runOnUiThread
                     hadError = true
+                    lastErrorText = describeError(t)
                     status.visibility = View.VISIBLE
-                    status.text = describeError(t)
+                    status.text = lastErrorText
                 }
             }
 
@@ -628,14 +692,26 @@ class LauncherActivity : Activity() {
     /* Input                                                              */
     /* ------------------------------------------------------------------ */
 
-    /** Maps a view coordinate to remote framebuffer pixels, or null if outside. */
+    /**
+     * Maps a view coordinate to remote framebuffer pixels, or null if outside
+     * — or if there is nothing to map onto yet.
+     *
+     * Both guards are needed. Until the first frame arrives, the renderer
+     * letterboxes nothing and reports the whole surface as the viewport, so a
+     * viewport-only check passes while `framebufferWidth` is still 0 and the
+     * `coerceIn(0, -1)` below throws. That is exactly the window after a
+     * connection drops on a timeout and the app is restarted.
+     */
     private fun toFramebuffer(viewX: Float, viewY: Float): Pair<Int, Int>? {
+        val fbW = renderer.framebufferWidth
+        val fbH = renderer.framebufferHeight
         if (renderer.viewportWidth <= 0 || renderer.viewportHeight <= 0) return null
+        if (fbW <= 0 || fbH <= 0) return null
         val fx = (viewX - renderer.viewportX) / renderer.viewportWidth.toFloat()
         val fy = (viewY - renderer.viewportY) / renderer.viewportHeight.toFloat()
         if (fx < 0f || fx > 1f || fy < 0f || fy > 1f) return null
-        val x = (fx * renderer.framebufferWidth).toInt().coerceIn(0, renderer.framebufferWidth - 1)
-        val y = (fy * renderer.framebufferHeight).toInt().coerceIn(0, renderer.framebufferHeight - 1)
+        val x = (fx * fbW).toInt().coerceIn(0, fbW - 1)
+        val y = (fy * fbH).toInt().coerceIn(0, fbH - 1)
         return x to y
     }
 
@@ -945,12 +1021,23 @@ class LauncherActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        destroyed = true
+        // Stales every in-flight callback, so a client thread that is still
+        // winding down cannot schedule a retry after the activity is gone.
+        connectionGeneration++
+        cancelPendingReconnect()
         client?.disconnect()
         client = null
     }
 
     private companion object {
         const val TAG = "LauncherActivity"
+
+        const val INITIAL_RECONNECT_DELAY_MS = 1000L
+        const val MAX_RECONNECT_DELAY_MS = 15000L
+
+        /** Enough to pass [MAX_RECONNECT_DELAY_MS]; keeps the shift in range. */
+        const val MAX_BACKOFF_SHIFT = 16
         const val BUTTON_LEFT = 1
         const val BUTTON_RIGHT = 3
         const val BUTTON_WHEEL_UP = 4
