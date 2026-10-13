@@ -89,13 +89,55 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
     var viewportHeight = 0
         private set
 
-    /** Called from the network thread whenever a new frame arrived. */
+    /**
+     * Region patches waiting to be uploaded. Drained on the GL thread in
+     * [onDrawFrame]. The client allocates a fresh array per patch (see
+     * [X11Client.publishRegion]), so a patch can never be overwritten while it
+     * is still queued.
+     *
+     * A queue rather than a single slot: several `DamageNotify` regions can
+     * arrive between two GL frames, and dropping all but the last would leave
+     * stale pixels on screen.
+     */
+    private val pendingPatches = java.util.ArrayDeque<RegionPatch>()
+
+    private class RegionPatch(val x: Int, val y: Int, val w: Int, val h: Int, val pixels: IntArray)
+
+    /**
+     * The dimensions the texture currently holds. Only meaningful once a full
+     * frame has been uploaded; a patch may not change them (glTexSubImage2D
+     * writes into the existing texture).
+     */
+    private var textureWidth = 0
+    private var textureHeight = 0
+
+    /** Called from the network thread whenever a new full frame arrived. */
     fun updateFramebuffer(width: Int, height: Int, pixels: IntArray) {
         pendingWidth = width
         pendingHeight = height
         pendingPixels = pixels
         framebufferWidth = width
         framebufferHeight = height
+        // A full frame replaces the whole texture, so anything queued for the
+        // previous one is obsolete and must not be applied on top.
+        synchronized(pendingPatches) { pendingPatches.clear() }
+        glView.requestRender()
+    }
+
+    /**
+     * Called from the network thread for a partial update — only the rectangle
+     * [x]..[x]+[w], [y]..[y]+[h] changed. Ignored until a full frame has
+     * established the texture (there is nothing to patch into yet).
+     */
+    fun updateFramebufferRegion(x: Int, y: Int, w: Int, h: Int, pixels: IntArray) {
+        if (w <= 0 || h <= 0 || pixels.size < w * h) return
+        synchronized(pendingPatches) {
+            // Bounded: if the GL thread is far behind (surface paused, device
+            // busy) the whole screen is more than likely damaged anyway, so
+            // waiting for one full frame beats an unbounded queue.
+            if (pendingPatches.size >= MAX_PENDING_PATCHES) return
+            pendingPatches.add(RegionPatch(x, y, w, h, pixels))
+        }
         glView.requestRender()
     }
 
@@ -193,10 +235,52 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
         val pixels = pendingPixels
         if (pixels != null && pendingWidth > 0 && pendingHeight > 0) {
             uploadTexture(pendingWidth, pendingHeight, pixels)
+            // Consume it. Without this a later patch-triggered render would
+            // re-upload the whole texture from a stale frame, which is exactly
+            // the 8 MB-per-frame cost the DAMAGE path exists to avoid.
+            pendingPixels = null
             drawQuad()
         }
+        applyPendingPatches()
+        // A patch updated the existing texture in place, so it still has to be
+        // drawn — but only if there is a texture at all.
+        if (textureWidth > 0 && textureHeight > 0) drawQuad()
         // Cursor is an overlay: GetImage never returns it, so we draw it here.
         drawCursor()
+    }
+
+    /**
+     * Uploads every queued region patch into the existing texture with
+     * `glTexSubImage2D`, which touches only the damaged pixels instead of
+     * re-sending the whole 8 MB framebuffer to the GPU.
+     */
+    private fun applyPendingPatches() {
+        if (textureWidth <= 0 || textureHeight <= 0) {
+            synchronized(pendingPatches) { pendingPatches.clear() }
+            return
+        }
+        while (true) {
+            val patch = synchronized(pendingPatches) { pendingPatches.poll() } ?: return
+            // Clamp to the texture: a stale patch from a since-resized screen
+            // must not make glTexSubImage2D read out of bounds.
+            val x = patch.x.coerceIn(0, textureWidth - 1)
+            val y = patch.y.coerceIn(0, textureHeight - 1)
+            val w = patch.w.coerceAtMost(textureWidth - x)
+            val h = patch.h.coerceAtMost(textureHeight - y)
+            if (w <= 0 || h <= 0) continue
+
+            val buffer = ByteBuffer.allocateDirect(w * h * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .asIntBuffer()
+            buffer.put(patch.pixels, 0, w * h)
+            buffer.position(0)
+
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+            GLES20.glTexSubImage2D(
+                    GLES20.GL_TEXTURE_2D, 0,
+                    x, y, w, h,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+        }
     }
 
     private fun uploadTexture(width: Int, height: Int, pixels: IntArray) {
@@ -216,6 +300,8 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
                 GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
                 width, height, 0,
                 GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer)
+        textureWidth = width
+        textureHeight = height
     }
 
     private fun drawQuad() {
@@ -353,6 +439,9 @@ class X11Renderer(private val glView: GLSurfaceView) : GLSurfaceView.Renderer {
 
         const val ARROW_W = 16
         const val ARROW_H = 16
+
+        /** Above this the queued patches are stale, not worth uploading. */
+        const val MAX_PENDING_PATCHES = 64
 
         /**
          * Classic white arrow with a black outline and a soft drop shadow,

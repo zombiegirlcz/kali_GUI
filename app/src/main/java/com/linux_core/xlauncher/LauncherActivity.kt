@@ -651,6 +651,14 @@ class LauncherActivity : Activity() {
                     renderer.updateFramebuffer(width, height, pixels)
                 }
 
+                // Partial update from the DAMAGE path: only this rectangle
+                // changed, so the renderer patches the existing texture instead
+                // of re-uploading the whole screen.
+                override fun onFramebufferRegion(x: Int, y: Int, w: Int, h: Int, pixels: IntArray) {
+                    if (stale()) return
+                    renderer.updateFramebufferRegion(x, y, w, h, pixels)
+                }
+
                 // X11Client's finally block always lands here, including
                 // after onError, so this is the single place that retries.
                 override fun onDisconnected() = runOnUiThread {
