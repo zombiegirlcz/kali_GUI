@@ -540,6 +540,13 @@ class X11Client {
     /* ------------------------------------------------------------------ */
 
     private fun frameLoop(listener: Listener) {
+        // Both loops publish full frames through [publishFrame], which reads
+        // frameA/frameB with `!!`. Allocate them here, once, for both paths —
+        // the DAMAGE loop's seed frame would otherwise dereference null and
+        // kill the session on its very first frame (which the activity then
+        // retries forever, since onConnected resets the attempt counter).
+        frameA = IntArray(screenWidth * screenHeight)
+        frameB = IntArray(screenWidth * screenHeight)
         if (damageActive) {
             damageFrameLoop(listener)
         } else {
@@ -634,9 +641,6 @@ class X11Client {
         val raw = ByteArray(rowBytes * h)
         val previous = ByteArray(raw.size)
         var havePrevious = false
-
-        frameA = IntArray(w * h)
-        frameB = IntArray(w * h)
 
         while (running.get()) {
             val started = System.currentTimeMillis()
