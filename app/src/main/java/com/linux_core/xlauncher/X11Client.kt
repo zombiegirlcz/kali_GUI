@@ -9,6 +9,9 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -70,8 +73,23 @@ class X11Client {
 
     private var socket: Socket? = null
     private var input: DataInputStream? = null
+
+    /** Read by both the frame loop and the input thread; see [submitInput]. */
+    @Volatile
     private var output: DataOutputStream? = null
     private val running = AtomicBoolean(false)
+
+    /**
+     * Input writes must never happen on the UI thread: Android throws
+     * NetworkOnMainThreadException for every socket write there, and this class
+     * logs that exception instead of crashing — so taps, drags, the wheel and
+     * keys all silently did nothing while the viewer still looked healthy.
+     * Writes go through this one thread instead, and a whole gesture (motion +
+     * button) is a single task, so the server never sees a button press from one
+     * gesture interleaved with a motion from the next.
+     */
+    @Volatile
+    private var inputExecutor: ExecutorService? = null
 
     /** Protects request writes: the frame loop and the UI thread share the socket. */
     private val writeLock = Any()
@@ -186,6 +204,9 @@ class X11Client {
             socket = sock
             input = DataInputStream(BufferedInputStream(sock.getInputStream(), 64 * 1024))
             output = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 64 * 1024))
+            inputExecutor = Executors.newSingleThreadExecutor { r ->
+                Thread(r, "x11-input").apply { isDaemon = true }
+            }
             running.set(true)
 
             handshake(listener)
@@ -873,9 +894,11 @@ class X11Client {
      * releases [button].
      */
     fun sendPointer(x: Int, y: Int, button: Int, pressed: Boolean?) {
-        inject(EV_MOTION, 0, x, y)
-        if (pressed != null) {
-            inject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, x, y)
+        submitInput {
+            writeInject(EV_MOTION, 0, x, y)
+            if (pressed != null) {
+                writeInject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, x, y)
+            }
         }
     }
 
@@ -885,11 +908,32 @@ class X11Client {
      * jumping the cursor to a stale location.
      */
     fun sendButton(button: Int, pressed: Boolean) {
-        inject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, 0, 0)
+        submitInput {
+            writeInject(if (pressed) EV_BUTTON_PRESS else EV_BUTTON_RELEASE, button, 0, 0)
+        }
     }
 
     fun sendKey(keycode: Int, pressed: Boolean) {
-        inject(if (pressed) EV_KEY_PRESS else EV_KEY_RELEASE, keycode, 0, 0)
+        submitInput {
+            writeInject(if (pressed) EV_KEY_PRESS else EV_KEY_RELEASE, keycode, 0, 0)
+        }
+    }
+
+    /**
+     * Runs [block] on the input thread, or drops it when the session is gone.
+     * One gesture stays one task, so the server never sees a button press from
+     * one gesture interleaved with a motion from the next.
+     */
+    private fun submitInput(block: () -> Unit) {
+        if (!running.get()) return
+        val exec = inputExecutor ?: return
+        try {
+            exec.execute {
+                if (running.get()) block()
+            }
+        } catch (_: RejectedExecutionException) {
+            // disconnect() shut the pool down; the session is already over.
+        }
     }
 
     /**
@@ -899,8 +943,8 @@ class X11Client {
      *   type(1) detail(1) sequence(2) time(4) root(4) event(4) child(4)
      *   rootX(2) rootY(2) eventX(2) eventY(2) state(2) sameScreen(1) pad(1)
      */
-    private fun inject(eventType: Int, detail: Int, x: Int, y: Int) {
-        if (!running.get()) return
+    /** Only ever called from the input thread, through [submitInput]. */
+    private fun writeInject(eventType: Int, detail: Int, x: Int, y: Int) {
         val out = output ?: return
         try {
             synchronized(writeLock) {
@@ -945,6 +989,8 @@ class X11Client {
         socket = null
         input = null
         output = null
+        inputExecutor?.shutdownNow()
+        inputExecutor = null
     }
 
     private companion object {
