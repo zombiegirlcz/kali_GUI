@@ -10,8 +10,8 @@ android {
         applicationId = "com.linux_core.xlauncher"
         minSdk = 28
         targetSdk = 28
-        versionCode = 1
-        versionName = "0.1-foundation"
+        versionCode = 3
+        versionName = "RDP"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -20,13 +20,13 @@ android {
         // Debug and release share the same keystore so `adb install -r` works across builds.
         // Same debug keystore as the host app (app/release.jks).
         create("release") {
-            storeFile = file("release.jks")
+            storeFile = file("debugkey.jks")
             storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "password123"
             keyAlias = System.getenv("KEY_ALIAS") ?: "debugkey"
             keyPassword = System.getenv("KEY_PASSWORD") ?: "password123"
         }
         getByName("debug") {
-            storeFile = file("release.jks")
+            storeFile = file("debugkey.jks")
             storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "password123"
             keyAlias = System.getenv("KEY_ALIAS") ?: "debugkey"
             keyPassword = System.getenv("KEY_PASSWORD") ?: "password123"
