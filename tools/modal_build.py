@@ -120,6 +120,9 @@ def sync(branch: str = ""):
         print(f"[sync] Repo už existuje na Volume — fetch + reset --hard origin/{branch}")
         subprocess.run(["git", "remote", "set-url", "origin", repo_url], cwd=dest, check=True)
         subprocess.run(["git", "fetch", "origin", branch], cwd=dest, check=True)
+        # Přepnout i HEAD na požadovanou větev, jinak build hlásí starou větev
+        # (klon zůstane na té, se kterou byl poprvé naklonovaný).
+        subprocess.run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=dest, check=True)
         subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], cwd=dest, check=True)
     else:
         print(f"[sync] Klonuji {GITHUB_REPO}@{branch} -> {dest}")
@@ -299,7 +302,7 @@ def publish_apk():
 )
 def verify_apk():
     """Print the signer certificate of the built APK."""
-    apk = "/vol/builds/app-debug.apk"
+    apk = "/vol/builds/kali-gui-debug.apk"
     if not os.path.exists(apk):
         print("[verify] APK not found on Volume!")
         sys.exit(1)
