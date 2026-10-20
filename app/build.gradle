@@ -22,13 +22,13 @@ android {
         create("release") {
             storeFile = file("release.jks")
             storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "password123"
-            keyAlias = System.getenv("KEY_ALIAS") ?: "releaseKey"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "debugkey"
             keyPassword = System.getenv("KEY_PASSWORD") ?: "password123"
         }
         getByName("debug") {
             storeFile = file("release.jks")
             storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "password123"
-            keyAlias = System.getenv("KEY_ALIAS") ?: "releaseKey"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "debugkey"
             keyPassword = System.getenv("KEY_PASSWORD") ?: "password123"
         }
     }
