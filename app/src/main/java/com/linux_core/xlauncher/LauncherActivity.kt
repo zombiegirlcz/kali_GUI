@@ -1,6 +1,7 @@
 package com.linux_core.xlauncher
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -57,6 +58,7 @@ class LauncherActivity : Activity() {
     private lateinit var modeButton: TextView
     private lateinit var imeProxy: EditText
     private lateinit var settings: LauncherSettings
+    private lateinit var sessions: SavedSessions
 
     private var client: X11Client? = null
     private var hadError = false
@@ -127,6 +129,9 @@ class LauncherActivity : Activity() {
     /** Pending long-press timer: hold still to grab (press & hold the button). */
     private var longPressRunnable: Runnable? = null
 
+    /** Single-tap left click, deferred by the double-tap window (see [schedulePendingTapClick]). */
+    private var pendingTapClick: Runnable? = null
+
     /** True while a long-press grab is active, i.e. the left button is held. */
     private var grabbing = false
 
@@ -187,6 +192,7 @@ class LauncherActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = LauncherSettings(this)
+        sessions = SavedSessions(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = (
                 View.SYSTEM_UI_FLAG_FULLSCREEN
@@ -241,7 +247,44 @@ class LauncherActivity : Activity() {
                     e.getInt("port", ConnectionConfig.DEFAULT.port))
         } ?: ConnectionConfig.DEFAULT
 
-        connectTo(settings.remoteConfig() ?: localConfig)
+        if (!handleRdpIntent(intent)) {
+            connectTo(settings.remoteConfig() ?: localConfig)
+        }
+    }
+
+    /** A `.rdp` opened while the app already runs arrives here (singleTop). */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleRdpIntent(intent)
+    }
+
+    /**
+     * Opens the `.rdp` named by a VIEW intent: parses it, remembers it in
+     * [sessions] and connects to its `full address`. Returns false when the
+     * intent is not a VIEW, so the caller falls back to the normal target.
+     */
+    private fun handleRdpIntent(intent: Intent?): Boolean {
+        if (intent?.action != Intent.ACTION_VIEW) return false
+        val uri = intent.data ?: return false
+
+        val text = try {
+            contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+        } catch (t: Exception) {
+            Log.e(TAG, "cannot read $uri", t)
+            null
+        }
+        val config = text?.let { RdpFile.connectionConfig(it) }
+        if (config == null) {
+            status.visibility = View.VISIBLE
+            status.text = "Soubor není platný .rdp (chybí řádek „full address“)\n$uri"
+            return true
+        }
+
+        val name = uri.lastPathSegment?.substringAfterLast('/')?.removeSuffix(".rdp") ?: config.host
+        sessions.add(SavedSessions.Entry(uri.toString(), name, config.host, config.port, System.currentTimeMillis()))
+        connectTo(config)
+        return true
     }
 
     /**
@@ -324,6 +367,7 @@ class LauncherActivity : Activity() {
         val esc = controlButton("Esc") { sendEscape() }
         val term = controlButton("⌘") { openTerminal() }
         val remote = controlButton("🌐") { showRemoteDialog() }
+        val saved = controlButton("📑") { showSavedSessionsDialog() }
         val gear = controlButton("⚙") { showSettingsDialog() }
 
         bar.addView(kb)
@@ -331,6 +375,7 @@ class LauncherActivity : Activity() {
         bar.addView(esc)
         bar.addView(term)
         bar.addView(remote)
+        bar.addView(saved)
         bar.addView(gear)
         return bar
     }
@@ -484,6 +529,40 @@ class LauncherActivity : Activity() {
             dialog.dismiss()
             connectTo(settings.remoteConfig() ?: localConfig)
         }
+    }
+
+    /**
+     * Lists the `.rdp` files opened so far, newest first. Tapping one
+     * reconnects to its target; the row dialog can also forget it. Forgetting
+     * only drops the entry here, the `.rdp` file itself is never deleted.
+     */
+    private fun showSavedSessionsDialog() {
+        val entries = sessions.all()
+        if (entries.isEmpty()) {
+            status.visibility = View.VISIBLE
+            status.text = "Žádné uložené .rdp instance. Otevři .rdp soubor z file manageru."
+            return
+        }
+        val labels = entries.map { "${it.name}\n${it.host}:${it.port}" }.toTypedArray()
+        android.app.AlertDialog.Builder(this)
+                .setTitle("Uložené instance (.rdp)")
+                .setItems(labels) { _, which -> showSavedSessionActionDialog(entries[which]) }
+                .setNegativeButton("Zavřít", null)
+                .show()
+    }
+
+    private fun showSavedSessionActionDialog(entry: SavedSessions.Entry) {
+        android.app.AlertDialog.Builder(this)
+                .setTitle(entry.name)
+                .setMessage("${entry.host}:${entry.port}\n\n${entry.uri}")
+                .setPositiveButton("Připojit") { _, _ -> connectTo(entry.config()) }
+                .setNeutralButton("Smazat ze seznamu") { _, _ ->
+                    sessions.remove(entry.uri)
+                    status.visibility = View.VISIBLE
+                    status.text = "Odebráno ze seznamu: ${entry.name}"
+                }
+                .setNegativeButton("Zrušit", null)
+                .show()
     }
 
     private fun controlButton(label: String, onClick: () -> Unit): TextView =
@@ -728,6 +807,7 @@ class LauncherActivity : Activity() {
         // Two-finger drag scrolls, in both modes.
         if (event.pointerCount >= 2) {
             cancelLongPress()
+            cancelPendingTapClick()
             releaseGrab(c)
             recentTapCount = 0
             // A second finger turns a TOUCH-mode press into a scroll: drop the
@@ -900,6 +980,9 @@ class LauncherActivity : Activity() {
                         if (recentTapCount >= 1) {
                             // Second touch of "click, click, hold": grab now,
                             // don't wait for a timer — not letting go IS the signal.
+                            // The first tap's click was deferred, so drop it here
+                            // instead of sending two clicks (= a double-click).
+                            cancelPendingTapClick()
                             grabbing = true
                             c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
                             c.sendButton(BUTTON_LEFT, true)
@@ -937,23 +1020,20 @@ class LauncherActivity : Activity() {
                 } else if (rightClicked) {
                     // Already fired by the hold timer; nothing left to do.
                 } else if (!dragged) {
-                    // A tap clicks the left button at the cursor. A drag must
-                    // never click, so only a slop-free gesture fires.
-                    renderer.updatePointer(cursorX, cursorY)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, true)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, false)
-                    // Register this as a tap so a second touch landing close by,
-                    // soon enough, grabs instead of clicking (tap-tap-hold).
+                    // A tap clicks the left button, but only after the double-tap
+                    // window passes with no second touch: sending it now would
+                    // make a quick second touch a second click (= double-click).
                     recentTapCount = 1
                     lastTapUpTime = System.currentTimeMillis()
                     lastTapX = event.x
                     lastTapY = event.y
+                    schedulePendingTapClick(c)
                 }
                 dragged = false
             }
             MotionEvent.ACTION_CANCEL -> {
                 cancelLongPress()
+                cancelPendingTapClick()
                 releaseGrab(c)
                 dragged = false
                 recentTapCount = 0
@@ -1018,6 +1098,24 @@ class LauncherActivity : Activity() {
     private fun cancelLongPress() {
         longPressRunnable?.let { gestureTimerHandler.removeCallbacks(it) }
         longPressRunnable = null
+    }
+
+    private fun schedulePendingTapClick(c: X11Client) {
+        cancelPendingTapClick()
+        val r = Runnable {
+            pendingTapClick = null
+            recentTapCount = 0
+            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
+            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, true)
+            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, false)
+        }
+        pendingTapClick = r
+        gestureTimerHandler.postDelayed(r, doubleTapTimeoutMs)
+    }
+
+    private fun cancelPendingTapClick() {
+        pendingTapClick?.let { gestureTimerHandler.removeCallbacks(it) }
+        pendingTapClick = null
     }
 
     private fun releaseGrab(c: X11Client) {
