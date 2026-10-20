@@ -172,7 +172,7 @@ def init_keys():
     keys_dir = "/vol/keys"
     os.makedirs(keys_dir, exist_ok=True)
 
-    key_path = os.path.join(keys_dir, "release.jks")
+    key_path = os.path.join(keys_dir, "debugkey.jks")
 
     if os.path.exists(key_path):
         print(f"[init] Key already exists at {key_path} (skipping).")
@@ -232,8 +232,8 @@ def build():
     with open(os.path.join(src_dir, "local.properties"), "w") as f:
         f.write(f"sdk.dir={ANDROID_SDK_ROOT}\n")
 
-    key_src = os.path.join(vol_keys, "release.jks")
-    key_dst = os.path.join(src_dir, "app", "release.jks")
+    key_src = os.path.join(vol_keys, "debugkey.jks")
+    key_dst = os.path.join(src_dir, "app", "debugkey.jks")
     if os.path.exists(key_src):
         shutil.copy2(key_src, key_dst)
         os.chmod(key_dst, 0o600)
@@ -241,7 +241,7 @@ def build():
     elif not os.path.exists(key_dst):
         print(
             "[build] WARNING: No signing key found! "
-            "Run init_keys first (or ensure app/release.jks is in source tree)."
+            "Run init_keys first (or ensure app/debugkey.jks is in source tree)."
         )
 
     gradlew = os.path.join(src_dir, "gradlew")
