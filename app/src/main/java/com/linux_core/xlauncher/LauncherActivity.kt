@@ -14,6 +14,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
@@ -21,6 +22,14 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.linux_core.xlauncher.input.GestureScheduler
+import com.linux_core.xlauncher.input.InputActionListener
+import com.linux_core.xlauncher.input.TouchAction
+import com.linux_core.xlauncher.input.TouchEvent
+import com.linux_core.xlauncher.input.TouchpadConfig
+import com.linux_core.xlauncher.input.Viewport
+import com.linux_core.xlauncher.input.key.X11KeyTable
+import com.linux_core.xlauncher.input.touchpad.TouchpadInputInterceptor
 import java.net.ConnectException
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
@@ -32,6 +41,14 @@ import java.net.URL
  * Connects to the X server that `nh desktop start` runs inside the proot guest
  * (Xvfb on display :0, TCP 127.0.0.1:6000) and renders its framebuffer with
  * OpenGL ES. Touch and key events are injected back through XTEST.
+ *
+ * Following the Microsoft "Windows App" (`com.microsoft.rdc.androidx`), the
+ * gesture state machine and key mapping no longer live in this Activity: they
+ * are the pure, unit-tested [com.linux_core.xlauncher.input] layer (modelled on
+ * `com.microsoft.windowsapp.input.*`). This Activity is only the Android
+ * adapter — it builds the UI, converts `MotionEvent`/`KeyEvent` into the layer's
+ * model types, and implements [InputActionListener] / [GestureScheduler] /
+ * [Viewport] against [X11Client] and [X11Renderer].
  *
  * Controls (floating bar, top-right):
  *   ⌨   show/hide the soft keyboard (keys are forwarded to the guest via XTEST)
@@ -55,94 +72,19 @@ class LauncherActivity : Activity() {
     private lateinit var modeButton: TextView
     private lateinit var imeProxy: EditText
     private lateinit var settings: LauncherSettings
+    private lateinit var interceptor: TouchpadInputInterceptor
 
     private var client: X11Client? = null
     private var hadError = false
 
-    /** false = touch (pointer follows finger), true = mouse (drag cursor). */
-    private var mouseMode = false
-
-    /** Cursor position in framebuffer pixels, used in mouse mode. */
-    private var cursorX = 0
-    private var cursorY = 0
-
-    // Gesture bookkeeping for mouse mode click detection.
-    private var downX = 0f
-    private var downY = 0f
-    private var downTime = 0L
-
     /**
-     * True once the finger travelled further than [tapSlopPx] during the
-     * gesture. A click is only delivered when this stays false, so releasing
-     * after dragging the pointer does NOT fire a click.
-     */
-    private var dragged = false
-
-    /** Anchor of the gesture start, used only for cumulative slop detection. */
-    private var slopAnchorX = 0f
-    private var slopAnchorY = 0f
-
-    /** Touch slop in pixels (~12dp); below this a gesture still counts as a tap. */
-    private val tapSlopPx: Float by lazy {
-        (12f * resources.displayMetrics.density)
-    }
-
-    /**
-     * Single Handler used to schedule AND cancel every gesture timer below
-     * (long-press and two-finger-hold). A fresh Handler() has its own
-     * identity, so removeCallbacks() on a different instance than the one
-     * that posted the Runnable is a silent no-op — the timer fires anyway,
-     * long after the finger already lifted. Must stay one shared instance
-     * per timer for cancellation to actually work.
+     * Single Handler used to schedule AND cancel every gesture timer (long-press
+     * and two-finger-hold) through [AndroidGestureScheduler]. A fresh Handler()
+     * has its own identity, so removeCallbacks() on a different instance is a
+     * silent no-op — the timer fires anyway, long after the finger lifted. Must
+     * stay one shared instance for cancellation to actually work.
      */
     private val gestureTimerHandler = Handler(Looper.getMainLooper())
-
-    /** Pending long-press timer: hold still to grab (press & hold the button). */
-    private var longPressRunnable: Runnable? = null
-
-    /** True while a long-press grab is active, i.e. the left button is held. */
-    private var grabbing = false
-
-    /**
-     * True once one finger completed a plain tap (down-up, no drag) within
-     * [doubleTapTimeoutMs] and [doubleTapSlopPx] of itself; a stale value
-     * (too slow or too far) resets to false on the next ACTION_DOWN. If the
-     * *next* touch-down lands while this is still true, that touch grabs the
-     * left button immediately — "click, click, and don't let go the second
-     * time" — instead of waiting on any timer. A plain first touch (this
-     * false) never grabs just by holding still — holding it instead
-     * right-clicks after a delay (see [scheduleLongPress]), so it never
-     * hijacks a drag that merely paused before moving.
-     */
-    private var recentTapCount = 0
-    private var lastTapUpTime = 0L
-    private var lastTapX = 0f
-    private var lastTapY = 0f
-
-    /** True once the current gesture's hold has already fired the right-click
-     *  (GRAB_DRAG/RIGHT_CLICK [HoldAction] settings only — see [scheduleLongPress]). */
-    private var rightClicked = false
-
-    private val doubleTapTimeoutMs: Long by lazy {
-        android.view.ViewConfiguration.getDoubleTapTimeout().toLong()
-    }
-    private val doubleTapSlopPx: Int by lazy {
-        android.view.ViewConfiguration.get(this).scaledDoubleTapSlop
-    }
-
-    /** Two-finger scroll bookkeeping (shared by both modes). */
-    private var scrolling = false
-    private var scrollLastY = 0f
-    private var scrollAccum = 0f
-    private var scrollAnchorY = 0f
-
-    /**
-     * Pending timer for "two fingers held still" -> right-click, armed in
-     * MOUSE mode regardless of [HoldAction] (see [onScrollTouch]). Cancelled
-     * the moment the two fingers actually move.
-     */
-    private var twoFingerHoldRunnable: Runnable? = null
-    private var twoFingerRightClicked = false
 
     /**
      * True while the soft keyboard is actually showing. Kept in sync by a
@@ -154,8 +96,45 @@ class LauncherActivity : Activity() {
      */
     private var keyboardVisible = false
 
-    /** True while TOUCH mode holds the left button down (finger on screen). */
-    private var directPressed = false
+    /* ------------------------------------------------------------------ */
+    /* Android adapters for the pure input layer                          */
+    /* ------------------------------------------------------------------ */
+
+    /** [Viewport] backed by the live renderer geometry. */
+    private val rendererViewport = object : Viewport {
+        override val viewportX get() = renderer.viewportX
+        override val viewportY get() = renderer.viewportY
+        override val viewportWidth get() = renderer.viewportWidth
+        override val viewportHeight get() = renderer.viewportHeight
+        override val framebufferWidth get() = renderer.framebufferWidth
+        override val framebufferHeight get() = renderer.framebufferHeight
+    }
+
+    /** [InputActionListener] driving the X server (XTEST) and the pointer sprite. */
+    private val inputSink = object : InputActionListener {
+        override fun sendPointer(x: Int, y: Int, button: Int, pressed: Boolean?) {
+            client?.sendPointer(x, y, button, pressed)
+        }
+        override fun sendButton(button: Int, pressed: Boolean) {
+            client?.sendButton(button, pressed)
+        }
+        override fun updateCursor(x: Int, y: Int) {
+            renderer.updatePointer(x, y)
+        }
+    }
+
+    /** [GestureScheduler] over the single shared [gestureTimerHandler]. */
+    private val gestureScheduler: GestureScheduler = AndroidGestureScheduler(gestureTimerHandler)
+
+    /** Live tuning snapshot: user settings + Android resources/ViewConfiguration. */
+    private fun currentConfig() = TouchpadConfig(
+        holdAction = settings.holdAction,
+        longPressMs = settings.longPressMs,
+        tapSlopPx = 12f * resources.displayMetrics.density,
+        scrollNotchPx = 24f * resources.displayMetrics.density,
+        doubleTapTimeoutMs = ViewConfiguration.getDoubleTapTimeout().toLong(),
+        doubleTapSlopPx = ViewConfiguration.get(this).scaledDoubleTapSlop,
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -170,6 +149,13 @@ class LauncherActivity : Activity() {
         renderer = X11Renderer(glView)
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+
+        interceptor = TouchpadInputInterceptor(
+            sink = inputSink,
+            scheduler = gestureScheduler,
+            viewport = rendererViewport,
+            config = ::currentConfig,
+        )
 
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -206,7 +192,9 @@ class LauncherActivity : Activity() {
         setContentView(root)
         trackKeyboardVisibility(root)
 
-        glView.setOnTouchListener { _, event -> onDesktopTouch(event) }
+        glView.setOnTouchListener { _, event ->
+            if (client == null) true else interceptor.onTouch(event.toTouchEvent())
+        }
 
         val config = intent.extras?.let { e ->
             ConnectionConfig(
@@ -216,6 +204,29 @@ class LauncherActivity : Activity() {
 
         status.text = getString(R.string.status_connecting, config.host, config.port)
         startConnection(config)
+    }
+
+    /** Converts an Android [MotionEvent] into the input layer's [TouchEvent]. */
+    private fun MotionEvent.toTouchEvent(): TouchEvent {
+        val mapped = when (actionMasked) {
+            MotionEvent.ACTION_DOWN -> TouchAction.DOWN
+            MotionEvent.ACTION_MOVE -> TouchAction.MOVE
+            MotionEvent.ACTION_UP -> TouchAction.UP
+            MotionEvent.ACTION_CANCEL -> TouchAction.CANCEL
+            MotionEvent.ACTION_POINTER_DOWN -> TouchAction.POINTER_DOWN
+            MotionEvent.ACTION_POINTER_UP -> TouchAction.POINTER_UP
+            else -> TouchAction.OTHER
+        }
+        val pc = pointerCount
+        return TouchEvent(
+            action = mapped,
+            pointerCount = pc,
+            x = getX(0),
+            y = getY(0),
+            x1 = if (pc > 1) getX(1) else 0f,
+            y1 = if (pc > 1) getY(1) else 0f,
+            timeMs = System.currentTimeMillis(),
+        )
     }
 
     /* ------------------------------------------------------------------ */
@@ -328,17 +339,15 @@ class LauncherActivity : Activity() {
             setOnClickListener { onClick() }
         }
 
-    private fun modeLabel(): String = if (mouseMode) "🖱" else "☝"
+    private fun modeLabel(): String = if (interceptor.mouseMode) "🖱" else "☝"
 
     private fun toggleMode() {
-        mouseMode = !mouseMode
+        interceptor.mouseMode = !interceptor.mouseMode
         modeButton.text = modeLabel()
         // Reset cursor to the middle of the screen when entering mouse mode.
-        cursorX = renderer.framebufferWidth / 2
-        cursorY = renderer.framebufferHeight / 2
-        renderer.updatePointer(cursorX, cursorY)
+        interceptor.setCursor(renderer.framebufferWidth / 2, renderer.framebufferHeight / 2)
         status.visibility = View.VISIBLE
-        status.text = if (mouseMode) "Mouse mode: drag = move, tap = click, hold = right-click, tap-tap+hold = grab & drag, 2-finger drag = scroll"
+        status.text = if (interceptor.mouseMode) "Mouse mode: drag = move, tap = click, hold = right-click, tap-tap+hold = grab & drag, 2-finger drag = scroll"
                        else "Touch mode: pointer follows finger"
         Handler(Looper.getMainLooper()).postDelayed({
             if (!hadError && client != null) status.visibility = View.GONE
@@ -393,8 +402,8 @@ class LauncherActivity : Activity() {
     }
 
     private fun sendEscape() {
-        client?.sendKey(X_KEY_ESCAPE, true)
-        client?.sendKey(X_KEY_ESCAPE, false)
+        client?.sendKey(X11KeyTable.ESCAPE, true)
+        client?.sendKey(X11KeyTable.ESCAPE, false)
     }
 
     /**
@@ -461,9 +470,7 @@ class LauncherActivity : Activity() {
                 override fun onConnected(width: Int, height: Int) = runOnUiThread {
                     hadError = false
                     status.visibility = View.GONE
-                    cursorX = width / 2
-                    cursorY = height / 2
-                    renderer.updatePointer(cursorX, cursorY)
+                    interceptor.setCursor(width / 2, height / 2)
                     glView.requestRender()
                 }
 
@@ -504,420 +511,87 @@ class LauncherActivity : Activity() {
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* Input                                                              */
-    /* ------------------------------------------------------------------ */
-
-    /** Maps a view coordinate to remote framebuffer pixels, or null if outside. */
-    private fun toFramebuffer(viewX: Float, viewY: Float): Pair<Int, Int>? {
-        if (renderer.viewportWidth <= 0 || renderer.viewportHeight <= 0) return null
-        val fx = (viewX - renderer.viewportX) / renderer.viewportWidth.toFloat()
-        val fy = (viewY - renderer.viewportY) / renderer.viewportHeight.toFloat()
-        if (fx < 0f || fx > 1f || fy < 0f || fy > 1f) return null
-        val x = (fx * renderer.framebufferWidth).toInt().coerceIn(0, renderer.framebufferWidth - 1)
-        val y = (fy * renderer.framebufferHeight).toInt().coerceIn(0, renderer.framebufferHeight - 1)
-        return x to y
-    }
-
-    private fun onDesktopTouch(event: MotionEvent): Boolean {
-        val c = client ?: return true
-        // Two-finger drag scrolls, in both modes.
-        if (event.pointerCount >= 2) {
-            cancelLongPress()
-            releaseGrab(c)
-            recentTapCount = 0
-            // A second finger turns a TOUCH-mode press into a scroll: drop the
-            // button we had already pressed, otherwise X keeps it held down.
-            if (directPressed) {
-                c.sendButton(BUTTON_LEFT, false)
-                directPressed = false
-            }
-            return onScrollTouch(c, event)
-        }
-        // Ignore the tail of a scroll gesture once the second finger lifted.
-        if (scrolling) {
-            if (event.actionMasked == MotionEvent.ACTION_UP ||
-                    event.actionMasked == MotionEvent.ACTION_CANCEL) {
-                scrolling = false
-                scrollAccum = 0f
-            }
-            return true
-        }
-        return if (mouseMode) onMouseTouch(c, event) else onDirectTouch(c, event)
-    }
-
-    /**
-     * TWO-FINGER gesture: the average Y of both fingers drives mouse-wheel
-     * button 4 (up) / 5 (down) once they actually move — dragging the fingers
-     * down scrolls the view up, like a touchscreen. Holding both fingers
-     * still instead (MOUSE mode, any [HoldAction] scheme) right-clicks at the
-     * cursor after [LauncherSettings.longPressMs] — this is the only
-     * right-click gesture under [HoldAction.GRAB_DRAG], and redundant with
-     * (but harmless alongside) the single-finger hold under
-     * [HoldAction.RIGHT_CLICK].
-     */
-    private fun onScrollTouch(c: X11Client, event: MotionEvent): Boolean {
-        val y = (event.getY(0) + event.getY(1)) / 2f
-        when (event.actionMasked) {
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                scrolling = true
-                scrollAccum = 0f
-                scrollLastY = y
-                scrollAnchorY = y
-                twoFingerRightClicked = false
-                if (mouseMode) {
-                    scheduleTwoFingerHold(c)
-                }
-            }
-            MotionEvent.ACTION_MOVE -> {
-                if (!scrolling) {
-                    scrolling = true
-                    scrollLastY = y
-                    scrollAnchorY = y
-                    return true
-                }
-                if (twoFingerHoldRunnable != null &&
-                        kotlin.math.abs(y - scrollAnchorY) > tapSlopPx) {
-                    // Real movement: this is a scroll, not a held-still right-click.
-                    cancelTwoFingerHold()
-                }
-                if (twoFingerRightClicked) return true
-                val dy = y - scrollLastY
-                scrollLastY = y
-                scrollAccum += dy
-                val notch = 24f * resources.displayMetrics.density
-                // Finger up (dy < 0) => content scrolls down => wheel down (5).
-                while (scrollAccum <= -notch) {
-                    scrollAccum += notch
-                    wheel(c, up = false)
-                }
-                while (scrollAccum >= notch) {
-                    scrollAccum -= notch
-                    wheel(c, up = true)
-                }
-            }
-            MotionEvent.ACTION_POINTER_UP -> {
-                cancelTwoFingerHold()
-                scrolling = false
-                scrollAccum = 0f
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                cancelTwoFingerHold()
-                scrolling = false
-                scrollAccum = 0f
-            }
-        }
-        return true
-    }
-
-    private fun scheduleTwoFingerHold(c: X11Client) {
-        cancelTwoFingerHold()
-        val r = Runnable {
-            twoFingerRightClicked = true
-            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-            c.sendButton(BUTTON_RIGHT, true)
-            c.sendButton(BUTTON_RIGHT, false)
-        }
-        twoFingerHoldRunnable = r
-        gestureTimerHandler.postDelayed(r, settings.longPressMs)
-    }
-
-    private fun cancelTwoFingerHold() {
-        twoFingerHoldRunnable?.let { gestureTimerHandler.removeCallbacks(it) }
-        twoFingerHoldRunnable = null
-    }
-
-    private fun wheel(c: X11Client, up: Boolean) {
-        val button = if (up) BUTTON_WHEEL_UP else BUTTON_WHEEL_DOWN
-        c.sendButton(button, true)
-        c.sendButton(button, false)
-    }
-
-    /** TOUCH mode: the X pointer follows the finger; down = press, up = release. */
-    private fun onDirectTouch(c: X11Client, event: MotionEvent): Boolean {
-        val (x, y) = toFramebuffer(event.x, event.y) ?: return true
-        renderer.updatePointer(x, y)
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                c.sendPointer(x, y, BUTTON_LEFT, true)
-                directPressed = true
-            }
-            MotionEvent.ACTION_MOVE -> c.sendPointer(x, y, BUTTON_LEFT, null)
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                c.sendPointer(x, y, BUTTON_LEFT, false)
-                directPressed = false
-            }
-        }
-        return true
-    }
-
-    /**
-     * MOUSE mode: trackpad-style — dragging moves the cursor relative to
-     * where it already is (motion only, no button), it does not jump under
-     * the finger and a plain hold never grabs just by being held (it
-     * right-clicks instead — see below — so it never hijacks an ordinary
-     * drag that merely paused for a moment before moving).
-     *
-     * With the default [HoldAction.TAP_TAP_HOLD] scheme: a short tap clicks
-     * the left button; a second touch-down landing soon enough and close
-     * enough to a completed tap grabs the left button *immediately* (no
-     * timer) — "click, click, and don't let go the second time" — so
-     * dragging that second touch moves/resizes windows. A hold with no
-     * prior tap right-clicks instead, via [scheduleLongPress]. Two fingers
-     * held still also right-click, and two fingers dragged scroll — both
-     * handled in [onScrollTouch].
-     *
-     * The [HoldAction.GRAB_DRAG]/[HoldAction.RIGHT_CLICK] settings replace
-     * the single-finger half of this with a plain hold-to-grab/right-click
-     * for every hold (no tap needed first), for anyone who prefers that
-     * over tap-counting.
-     */
-    private fun onMouseTouch(c: X11Client, event: MotionEvent): Boolean {
-        if (renderer.viewportWidth <= 0 || renderer.framebufferWidth <= 0) return true
-
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                downX = event.x
-                downY = event.y
-                slopAnchorX = event.x
-                slopAnchorY = event.y
-                downTime = System.currentTimeMillis()
-                dragged = false
-                grabbing = false
-                rightClicked = false
-                val sinceLastTap = downTime - lastTapUpTime
-                val closeToLastTap = recentTapCount > 0 &&
-                        sinceLastTap <= doubleTapTimeoutMs &&
-                        distance(event.x, event.y, lastTapX, lastTapY) <= doubleTapSlopPx
-                if (!closeToLastTap) recentTapCount = 0
-
-                when (settings.holdAction) {
-                    HoldAction.TAP_TAP_HOLD -> {
-                        if (recentTapCount >= 1) {
-                            // Second touch of "click, click, hold": grab now,
-                            // don't wait for a timer — not letting go IS the signal.
-                            grabbing = true
-                            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                            c.sendButton(BUTTON_LEFT, true)
-                        } else {
-                            // Plain first touch: no prior tap to grab off of,
-                            // so a hold-still instead right-clicks (a drag
-                            // before the timer fires cancels it, see below).
-                            scheduleLongPress(c)
-                        }
-                    }
-                    HoldAction.GRAB_DRAG, HoldAction.RIGHT_CLICK -> scheduleLongPress(c)
-                }
-            }
-            MotionEvent.ACTION_MOVE -> {
-                // Cumulative travel since the gesture started decides tap vs drag.
-                val slopX = event.x - slopAnchorX
-                val slopY = event.y - slopAnchorY
-                if (!dragged && (slopX * slopX + slopY * slopY) > tapSlopPx * tapSlopPx) {
-                    dragged = true
-                    cancelLongPress()
-                    recentTapCount = 0
-                }
-                movePointer(c, event)
-                // Re-anchor so the next MOVE only applies the new delta.
-                downX = event.x
-                downY = event.y
-            }
-            MotionEvent.ACTION_UP -> {
-                cancelLongPress()
-                if (grabbing) {
-                    // End the grab: release the held button in place.
-                    c.sendButton(BUTTON_LEFT, false)
-                    grabbing = false
-                    recentTapCount = 0
-                } else if (rightClicked) {
-                    // Already fired by the hold timer; nothing left to do.
-                } else if (!dragged) {
-                    // A tap clicks the left button at the cursor. A drag must
-                    // never click, so only a slop-free gesture fires.
-                    renderer.updatePointer(cursorX, cursorY)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, true)
-                    c.sendPointer(cursorX, cursorY, BUTTON_LEFT, false)
-                    // Register this as a tap so a second touch landing close by,
-                    // soon enough, grabs instead of clicking (tap-tap-hold).
-                    recentTapCount = 1
-                    lastTapUpTime = System.currentTimeMillis()
-                    lastTapX = event.x
-                    lastTapY = event.y
-                }
-                dragged = false
-            }
-            MotionEvent.ACTION_CANCEL -> {
-                cancelLongPress()
-                releaseGrab(c)
-                dragged = false
-                recentTapCount = 0
-            }
-        }
-        return true
-    }
-
-    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
-        val dx = x1 - x2
-        val dy = y1 - y2
-        return kotlin.math.sqrt(dx * dx + dy * dy)
-    }
-
-    /** Applies one-finger motion to the cursor (pure motion, no button change). */
-    private fun movePointer(c: X11Client, event: MotionEvent) {
-        val dx = (event.x - downX) / renderer.viewportWidth.toFloat() * renderer.framebufferWidth
-        val dy = (event.y - downY) / renderer.viewportHeight.toFloat() * renderer.framebufferHeight
-        val nx = (cursorX + dx).toInt().coerceIn(0, renderer.framebufferWidth - 1)
-        val ny = (cursorY + dy).toInt().coerceIn(0, renderer.framebufferHeight - 1)
-        if (nx != cursorX || ny != cursorY) {
-            cursorX = nx
-            cursorY = ny
-            renderer.updatePointer(cursorX, cursorY)
-            // Pure motion: if the left button is held from a long-press grab,
-            // X keeps it down across motion events.
-            c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-        }
-    }
-
-    /**
-     * Plain single-finger hold-to-grab/right-click. Used by
-     * [HoldAction.GRAB_DRAG] (grab) and [HoldAction.RIGHT_CLICK] (right-click)
-     * for every hold, and by the default [HoldAction.TAP_TAP_HOLD] scheme
-     * for a hold with no prior tap (right-click) — tap-then-hold instead
-     * grabs immediately without this timer (see [onMouseTouch]).
-     */
-    private fun scheduleLongPress(c: X11Client) {
-        cancelLongPress()
-        val r = Runnable {
-            if (!dragged && !grabbing && !rightClicked) {
-                // Button events use the pointer's current position, so make
-                // sure the X pointer really is at the on-screen cursor first:
-                // on a fresh connection no motion has been sent yet and the
-                // server pointer would still be at (0,0).
-                c.sendPointer(cursorX, cursorY, BUTTON_LEFT, null)
-                if (settings.holdAction == HoldAction.GRAB_DRAG) {
-                    grabbing = true
-                    c.sendButton(BUTTON_LEFT, true)
-                } else {
-                    // RIGHT_CLICK setting, or TAP_TAP_HOLD's plain-hold case.
-                    rightClicked = true
-                    c.sendButton(BUTTON_RIGHT, true)
-                    c.sendButton(BUTTON_RIGHT, false)
-                }
-            }
-        }
-        longPressRunnable = r
-        gestureTimerHandler.postDelayed(r, settings.longPressMs)
-    }
-
-    private fun cancelLongPress() {
-        longPressRunnable?.let { gestureTimerHandler.removeCallbacks(it) }
-        longPressRunnable = null
-    }
-
-    private fun releaseGrab(c: X11Client) {
-        if (grabbing) {
-            c.sendButton(BUTTON_LEFT, false)
-            grabbing = false
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         client?.disconnect()
         client = null
     }
 
+    /**
+     * Android keycode -> X keycode, for the keys we care about. 0 = unmapped.
+     * The pure per-key tables live in [X11KeyTable] (the Windows App's
+     * `AsciiToScanCodeMappings` role); this `when` is the thin Android
+     * `KeyEvent` dispatch (its `KeyEventExtKt` role).
+     */
+    private fun xKeycode(keyCode: Int): Int = when (keyCode) {
+        in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ->
+            X11KeyTable.letter(keyCode - KeyEvent.KEYCODE_A)
+        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 ->
+            X11KeyTable.digit(keyCode - KeyEvent.KEYCODE_0)
+        KeyEvent.KEYCODE_ESCAPE -> X11KeyTable.ESCAPE
+        KeyEvent.KEYCODE_ENTER -> 36
+        KeyEvent.KEYCODE_DEL -> 22
+        KeyEvent.KEYCODE_FORWARD_DEL -> 119
+        KeyEvent.KEYCODE_TAB -> 23
+        KeyEvent.KEYCODE_SPACE -> 65
+        KeyEvent.KEYCODE_MINUS -> 20
+        KeyEvent.KEYCODE_EQUALS -> 21
+        KeyEvent.KEYCODE_LEFT_BRACKET -> 34
+        KeyEvent.KEYCODE_RIGHT_BRACKET -> 35
+        KeyEvent.KEYCODE_BACKSLASH -> 51
+        KeyEvent.KEYCODE_SEMICOLON -> 47
+        KeyEvent.KEYCODE_APOSTROPHE -> 48
+        KeyEvent.KEYCODE_GRAVE -> 49
+        KeyEvent.KEYCODE_COMMA -> 59
+        KeyEvent.KEYCODE_PERIOD -> 60
+        KeyEvent.KEYCODE_SLASH -> 61
+        KeyEvent.KEYCODE_SHIFT_LEFT -> 50
+        KeyEvent.KEYCODE_SHIFT_RIGHT -> 62
+        KeyEvent.KEYCODE_CTRL_LEFT -> 37
+        KeyEvent.KEYCODE_CTRL_RIGHT -> 105
+        KeyEvent.KEYCODE_ALT_LEFT -> 64
+        KeyEvent.KEYCODE_ALT_RIGHT -> 108
+        KeyEvent.KEYCODE_DPAD_UP -> 111
+        KeyEvent.KEYCODE_DPAD_DOWN -> 116
+        KeyEvent.KEYCODE_DPAD_LEFT -> 113
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 114
+        KeyEvent.KEYCODE_MOVE_HOME -> 110
+        KeyEvent.KEYCODE_MOVE_END -> 115
+        KeyEvent.KEYCODE_PAGE_UP -> 112
+        KeyEvent.KEYCODE_PAGE_DOWN -> 117
+        KeyEvent.KEYCODE_INSERT -> 118
+        in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 ->
+            X11KeyTable.functionKey(keyCode - KeyEvent.KEYCODE_F1)
+        else -> 0
+    }
+
     private companion object {
         const val TAG = "LauncherActivity"
-        const val BUTTON_LEFT = 1
-        const val BUTTON_RIGHT = 3
-        const val BUTTON_WHEEL_UP = 4
-        const val BUTTON_WHEEL_DOWN = 5
-
-        const val X_KEY_ESCAPE = 9
 
         /** Localhost REST bridge of the core app (Loopback: no Bearer token). */
         const val CORE_TERMINAL_URL = "http://127.0.0.1:1337/terminal/open"
+    }
+}
 
-        /**
-         * X keycodes for a US layout, indexed by `letter - 'a'`. The X physical
-         * order follows QWERTY, not the alphabet, so a table is required.
-         */
-        val LETTER_KEYCODES = intArrayOf(
-                38, // a
-                56, // b
-                54, // c
-                40, // d
-                26, // e
-                41, // f
-                42, // g
-                43, // h
-                31, // i
-                44, // j
-                45, // k
-                46, // l
-                58, // m
-                57, // n
-                32, // o
-                33, // p
-                24, // q
-                27, // r
-                39, // s
-                28, // t
-                30, // u
-                55, // v
-                25, // w
-                53, // x
-                29, // y
-                52, // z
-        )
+/**
+ * [GestureScheduler] over a single shared [Handler]. Tracks each token's
+ * posted [Runnable] so [cancel] removes exactly the instance that was posted —
+ * the reason the launcher uses one shared Handler rather than ad-hoc ones.
+ */
+private class AndroidGestureScheduler(private val handler: Handler) : GestureScheduler {
+    private val pending = HashMap<Any, Runnable>()
 
-        /** Android keycode -> X keycode, for the keys we care about. 0 = unmapped. */
-        fun xKeycode(keyCode: Int): Int = when (keyCode) {
-            in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ->
-                LETTER_KEYCODES[keyCode - KeyEvent.KEYCODE_A]
-            in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> {
-                val digit = keyCode - KeyEvent.KEYCODE_0
-                if (digit == 0) 19 else 9 + digit
-            }
-            KeyEvent.KEYCODE_ESCAPE -> 9
-            KeyEvent.KEYCODE_ENTER -> 36
-            KeyEvent.KEYCODE_DEL -> 22
-            KeyEvent.KEYCODE_FORWARD_DEL -> 119
-            KeyEvent.KEYCODE_TAB -> 23
-            KeyEvent.KEYCODE_SPACE -> 65
-            KeyEvent.KEYCODE_MINUS -> 20
-            KeyEvent.KEYCODE_EQUALS -> 21
-            KeyEvent.KEYCODE_LEFT_BRACKET -> 34
-            KeyEvent.KEYCODE_RIGHT_BRACKET -> 35
-            KeyEvent.KEYCODE_BACKSLASH -> 51
-            KeyEvent.KEYCODE_SEMICOLON -> 47
-            KeyEvent.KEYCODE_APOSTROPHE -> 48
-            KeyEvent.KEYCODE_GRAVE -> 49
-            KeyEvent.KEYCODE_COMMA -> 59
-            KeyEvent.KEYCODE_PERIOD -> 60
-            KeyEvent.KEYCODE_SLASH -> 61
-            KeyEvent.KEYCODE_SHIFT_LEFT -> 50
-            KeyEvent.KEYCODE_SHIFT_RIGHT -> 62
-            KeyEvent.KEYCODE_CTRL_LEFT -> 37
-            KeyEvent.KEYCODE_CTRL_RIGHT -> 105
-            KeyEvent.KEYCODE_ALT_LEFT -> 64
-            KeyEvent.KEYCODE_ALT_RIGHT -> 108
-            KeyEvent.KEYCODE_DPAD_UP -> 111
-            KeyEvent.KEYCODE_DPAD_DOWN -> 116
-            KeyEvent.KEYCODE_DPAD_LEFT -> 113
-            KeyEvent.KEYCODE_DPAD_RIGHT -> 114
-            KeyEvent.KEYCODE_MOVE_HOME -> 110
-            KeyEvent.KEYCODE_MOVE_END -> 115
-            KeyEvent.KEYCODE_PAGE_UP -> 112
-            KeyEvent.KEYCODE_PAGE_DOWN -> 117
-            KeyEvent.KEYCODE_INSERT -> 118
-            in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 ->
-                // F1..F12 are 131..142 in Android, X has them at 67..76 and 95..96
-                (keyCode - KeyEvent.KEYCODE_F1).let { if (it < 10) 67 + it else 95 + (it - 10) }
-            else -> 0
+    override fun postDelayed(token: Any, delayMs: Long, action: () -> Unit) {
+        cancel(token)
+        val r = Runnable {
+            pending.remove(token)
+            action()
         }
+        pending[token] = r
+        handler.postDelayed(r, delayMs)
+    }
+
+    override fun cancel(token: Any) {
+        pending.remove(token)?.let { handler.removeCallbacks(it) }
     }
 }

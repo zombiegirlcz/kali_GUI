@@ -54,4 +54,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0")
+
+    // Pure-JVM unit tests for the com.linux_core.xlauncher.input layer.
+    testImplementation("junit:junit:4.13.2")
 }
